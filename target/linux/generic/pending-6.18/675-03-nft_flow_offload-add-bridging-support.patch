@@ -32,6 +32,10 @@ Also:
   the bridge ingress device is correctly tracked regardless of path type.
 - DEV_PATH_BR_VLAN_UNTAG: guard decrement with WARN_ON_ONCE to catch
   underflow without nulling info->indev as a side effect.
+- nft_flow_route_bridging: release the rt_dst_alloc/ip6_dst_alloc
+  references after nft_default_forward_path clones them into the route.
+  The route tuple holds its own clone; without dropping the allocation
+  reference the dst leaks on both the success and failure paths.
 
 Based-on-patch-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
 Signed-off-by: Ryan Chen <rchen14b@gmail.com>
@@ -230,7 +234,7 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
  {
  	struct dst_entry *this_dst = skb_dst(pkt->skb);
  	struct dst_entry *other_dst = NULL;
-@@ -270,15 +345,81 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+@@ -270,15 +345,84 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
  	nft_default_forward_path(route, this_dst, dir);
  	nft_default_forward_path(route, other_dst, !dir);
 
@@ -298,6 +302,9 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
 +
 +	nft_default_forward_path(route, dsts[dir], dir);
 +	nft_default_forward_path(route, dsts[!dir], !dir);
++	/* Drop allocation references; route->tuple[*].dst holds the clones. */
++	dst_release(dsts[dir]);
++	dst_release(dsts[!dir]);
 +
 +	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
 +	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
