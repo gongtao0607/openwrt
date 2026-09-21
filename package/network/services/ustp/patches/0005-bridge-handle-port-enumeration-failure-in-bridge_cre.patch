@@ -1,0 +1,37 @@
+From f8852c4ea0c183a855aea193dc0f0458379a2b47 Mon Sep 17 00:00:00 2001
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Sat, 26 Sep 2026 06:42:43 +0000
+Subject: [PATCH ustp] bridge: handle port enumeration failure in bridge_create
+
+scandir() returns -1 when the bridge's brif directory cannot be read, e.g.
+when the bridge is deleted between queueing WORKER_EV_BRIDGE_ADD and the
+worker processing it. The negative count is then passed to alloca() and
+the namelist is left uninitialized.
+
+Bail out instead. The existing port list of the bridge is left untouched.
+
+Based on a patch by Jan Leon from openwrt/ustp#6.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ bridge_track.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/bridge_track.c b/bridge_track.c
+index 9117c17..daa0656 100644
+--- a/bridge_track.c
++++ b/bridge_track.c
+@@ -665,6 +665,10 @@ int bridge_create(int bridge_idx, CIST_BridgeConfig *cfg)
+ 		set_br_up(br, !!(flags & IFF_UP));
+ 
+ 	n_ports = get_port_list(br->sysdeps.name, &namelist);
++	if (n_ports < 0) {
++		ERROR_BRNAME(br, "Couldn't enumerate bridge ports: %m");
++		return -1;
++	}
+ 	port_list = alloca(n_ports * sizeof(*port_list));
+ 
+ 	for (i = 0; i < n_ports; i++) {
+-- 
+2.55.0
+
