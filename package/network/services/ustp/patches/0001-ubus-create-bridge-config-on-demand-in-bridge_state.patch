@@ -1,0 +1,43 @@
+From 254f7122ab071ec4c5989aabb47f14ac0be1f6a6 Mon Sep 17 00:00:00 2001
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Sun, 20 Sep 2026 07:15:24 +0000
+Subject: [PATCH ustp] ubus: create bridge config on demand in bridge_state
+
+The kernel runs /sbin/bridge-stp as soon as a bridge is created with STP
+enabled, which calls ustp's bridge_state. netifd sends the bridge's config
+in a stp_init notification just before creating the bridge, but ustpd only
+receives that if it is already subscribed to network.device - and it polls
+for that object once per second.
+
+If the bridge is created inside that polling gap, bridge_state has no config
+for it and returns NOT_FOUND. When the userspace helper fails, the kernel
+falls back to in-kernel legacy 802.1D STP and transmits Version 0 Config
+BPDUs onto the wire, permanently causing connected RSTP switches to downgrade
+to legacy STP.
+
+Create the config instead of refusing. A fresh config is zeroed, so all its
+set_* flags are false and the bridge operates with ustpd's default RSTP
+parameters; netifd's real values arrive moments later via stp_init.
+
+Link: https://github.com/openwrt/ustp/issues/8
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ ubus.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ubus.c b/ubus.c
+index 201761c..9dd5bb3 100644
+--- a/ubus.c
++++ b/ubus.c
+@@ -135,7 +135,7 @@ ubus_bridge_state(struct ubus_context *ctx, struct ubus_object *obj,
+ 		return UBUS_STATUS_NOT_FOUND;
+ 
+ 	if (blobmsg_get_bool(tb[BRIDGE_STATE_ENABLED])) {
+-		cfg = bridge_config_get(bridge_name, false);
++		cfg = bridge_config_get(bridge_name, true);
+ 		if (!cfg)
+ 			return UBUS_STATUS_NOT_FOUND;
+ 
+-- 
+2.55.0
+

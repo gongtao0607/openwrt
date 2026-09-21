@@ -1,0 +1,39 @@
+From 506e90d07c1aed1b76cf8a9499fda55f9918c284 Mon Sep 17 00:00:00 2001
+From: Jan Leon <Jan.gaschler@gmail.com>
+Date: Sat, 18 Jul 2026 16:59:37 +0200
+Subject: [PATCH ustp] bridge: preserve BPDU filter state on read errors
+
+(cherry picked from commit 375bca93ad790eb70d72a95f1f23d3e372f194e4)
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ bridge_track.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/bridge_track.c b/bridge_track.c
+index 98ce3b5..9117c17 100644
+--- a/bridge_track.c
++++ b/bridge_track.c
+@@ -217,7 +217,7 @@ static void set_if_up(port_t *prt, bool up)
+     int speed = -1;
+     int duplex = -1;
+     bool changed = false;
+-    bool bpdu_filter;
++    int bpdu_filter;
+ 
+     if(check_mac_address(prt->sysdeps.name, prt->sysdeps.macaddr))
+     {
+@@ -264,9 +264,9 @@ static void set_if_up(port_t *prt, bool up)
+         }
+ 
+ 	bpdu_filter = get_bpdu_filter(prt->sysdeps.name);
+-	if (bpdu_filter != prt->bpduFilterPort) {
++	if (bpdu_filter >= 0 && !!bpdu_filter != prt->bpduFilterPort) {
+ 	    CIST_PortConfig cfg = {
+-		    .bpdu_filter_port = bpdu_filter,
++		    .bpdu_filter_port = !!bpdu_filter,
+ 		    .set_bpdu_filter_port = true
+ 	    };
+ 
+-- 
+2.55.0
+

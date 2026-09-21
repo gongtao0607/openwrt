@@ -1,0 +1,85 @@
+From 9b988add9c4d875d5f37683087dd96a47778a758 Mon Sep 17 00:00:00 2001
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Sat, 26 Sep 2026 06:43:17 +0000
+Subject: [PATCH ustp] bridge: round kernel bridge priority instead of
+ rejecting it
+
+netifd always sets IFLA_BR_PRIORITY and defaults it to 0x7FFF, so on a
+bridge without an explicit priority, get_bridge_priority() rejected the
+value and logged two errors on every bridge activation, one of them
+claiming a sysfs read error that never happened.
+
+The kernel accepts any 16-bit priority while 802.1D-2004/802.1Q only allow
+multiples of 4096. Round to the nearest step and clamp it to 61440 instead,
+which maps netifd's default 0x7FFF to the standard default 0x8000. Only
+report an error when the sysfs read actually fails.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ bridge_track.c | 18 +++++++++++++++---
+ netif_utils.c  | 11 +----------
+ 2 files changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/bridge_track.c b/bridge_track.c
+index 3096401..38951e0 100644
+--- a/bridge_track.c
++++ b/bridge_track.c
+@@ -649,7 +649,7 @@ int bridge_create(int bridge_idx, CIST_BridgeConfig *cfg)
+ 	bridge_t *br, *other_br;
+     port_t *port, *tmp;
+ 	int flags;
+-	int priority;
++	int priority, prio_step;
+ 	bool found;
+ 	int i;
+ 
+@@ -662,12 +662,24 @@ int bridge_create(int bridge_idx, CIST_BridgeConfig *cfg)
+ 	MSTP_IN_set_cist_bridge_config(br, cfg);
+ 	priority = get_bridge_priority(br->sysdeps.name);
+ 	if (priority >= 0) {
+-		if (MSTP_IN_set_cist_bridge_priority(br, priority / 4096))
++		/*
++		 * The kernel accepts any 16-bit value, but 802.1D-2004/802.1Q
++		 * only allow steps of 4096. netifd defaults to 0x7FFF, which
++		 * rounds to the standard default of 0x8000.
++		 */
++		prio_step = (priority + 2048) / 4096;
++		if (prio_step > 15)
++			prio_step = 15;
++		if (MSTP_IN_set_cist_bridge_priority(br, prio_step))
+ 			ERROR_BRNAME(br, "Couldn't apply bridge priority %d", priority);
++		else if (prio_step * 4096 != priority)
++			INFO_BRNAME(br, "Set bridge priority to %d (kernel value %d rounded to a multiple of 4096)",
++				    prio_step * 4096, priority);
+ 		else
+ 			INFO_BRNAME(br, "Set bridge priority to %d", priority);
+ 	} else {
+-		ERROR_BRNAME(br, "Keeping current bridge priority after sysfs read error");
++		ERROR_BRNAME(br, "Couldn't read bridge priority, keeping %d",
++			     GET_PRIORITY_FROM_IDENTIFIER(GET_CIST_TREE(br)->BridgeIdentifier) << 8);
+ 	}
+ 
+ 	flags = get_flags(br->sysdeps.name);
+diff --git a/netif_utils.c b/netif_utils.c
+index 5b35892..694cbf1 100644
+--- a/netif_utils.c
++++ b/netif_utils.c
+@@ -187,14 +187,5 @@ int get_bridge_portno(char *if_name)
+ 
+ int get_bridge_priority(char *if_name)
+ {
+-	int priority = get_netdev_file(if_name, "bridge", "priority");
+-
+-	if (priority < 0)
+-		return -1;
+-	if (priority > 61440 || priority % 4096) {
+-		ERROR("Invalid bridge priority %d for %s", priority, if_name);
+-		return -1;
+-	}
+-
+-	return priority;
++	return get_netdev_file(if_name, "bridge", "priority");
+ }
+-- 
+2.55.0
+
