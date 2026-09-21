@@ -1,0 +1,27 @@
+From 00ac757895c99f1c32fc9398afcebeb9a5d9a597 Mon Sep 17 00:00:00 2001
+From: Jan Leon <Jan.gaschler@gmail.com>
+Date: Sat, 18 Jul 2026 16:59:00 +0200
+Subject: [PATCH ustp] bridge: exclude dot entries from port scans
+
+(cherry picked from commit 69ba4b1dd70369cdd7f23279077075f26db2cf4c)
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ bridge_track.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bridge_track.c b/bridge_track.c
+index 151a03c..98ce3b5 100644
+--- a/bridge_track.c
++++ b/bridge_track.c
+@@ -630,7 +630,7 @@ static int not_dot_dotdot(const struct dirent *entry)
+ {
+ 	const char *n = entry->d_name;
+ 
+-	return strcmp(n, ".") || strcmp(n, "..");
++	return strcmp(n, ".") && strcmp(n, "..");
+ }
+ 
+ static int get_port_list(const char *br_ifname, struct dirent ***namelist)
+-- 
+2.55.0
+
