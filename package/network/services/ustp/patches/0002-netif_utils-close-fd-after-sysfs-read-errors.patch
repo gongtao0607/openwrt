@@ -1,0 +1,27 @@
+From 6284c8838fc458f7a82c756bd43ffdfd22163a2c Mon Sep 17 00:00:00 2001
+From: Jan Leon <Jan.gaschler@gmail.com>
+Date: Sat, 18 Jul 2026 16:58:47 +0200
+Subject: [PATCH ustp] netif_utils: close fd after sysfs read errors
+
+(cherry picked from commit 78703d521d784a4e394ae11bc1860212122f82c1)
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ netif_utils.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/netif_utils.c b/netif_utils.c
+index 2bf59c4..2f4194f 100644
+--- a/netif_utils.c
++++ b/netif_utils.c
+@@ -145,7 +145,7 @@ static int get_port_file(const char *if_name, const char *file)
+     int l;
+     if((l = read(fd, buf, sizeof(buf) - 1)) < 0) {
+         ERROR("Failed to read file %s: error %m", file);
+-        return -1;
++        goto out;
+     }
+     if(0 == l)
+     {
+-- 
+2.55.0
+

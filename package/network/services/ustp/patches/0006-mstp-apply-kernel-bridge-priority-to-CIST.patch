@@ -1,0 +1,142 @@
+From 19cfe7363e56246ccfc60b61a5bbf3fabb11ef70 Mon Sep 17 00:00:00 2001
+From: Jan Leon <Jan.gaschler@gmail.com>
+Date: Sat, 18 Jul 2026 17:00:35 +0200
+Subject: [PATCH ustp] mstp: apply kernel bridge priority to CIST
+
+(cherry picked from commit 9b59775981ab440403d2a17b6188d51bb9c692d8)
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+ bridge_track.c | 10 ++++++++++
+ mstp.c         | 11 +++++++++++
+ mstp.h         |  1 +
+ netif_utils.c  | 27 ++++++++++++++++++++++-----
+ netif_utils.h  |  1 +
+ 5 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/bridge_track.c b/bridge_track.c
+index daa0656..3096401 100644
+--- a/bridge_track.c
++++ b/bridge_track.c
+@@ -649,6 +649,7 @@ int bridge_create(int bridge_idx, CIST_BridgeConfig *cfg)
+ 	bridge_t *br, *other_br;
+     port_t *port, *tmp;
+ 	int flags;
++	int priority;
+ 	bool found;
+ 	int i;
+ 
+@@ -659,6 +660,15 @@ int bridge_create(int bridge_idx, CIST_BridgeConfig *cfg)
+ 		return -1;
+ 
+ 	MSTP_IN_set_cist_bridge_config(br, cfg);
++	priority = get_bridge_priority(br->sysdeps.name);
++	if (priority >= 0) {
++		if (MSTP_IN_set_cist_bridge_priority(br, priority / 4096))
++			ERROR_BRNAME(br, "Couldn't apply bridge priority %d", priority);
++		else
++			INFO_BRNAME(br, "Set bridge priority to %d", priority);
++	} else {
++		ERROR_BRNAME(br, "Keeping current bridge priority after sysfs read error");
++	}
+ 
+ 	flags = get_flags(br->sysdeps.name);
+ 	if (flags >= 0)
+diff --git a/mstp.c b/mstp.c
+index f466d81..7375224 100644
+--- a/mstp.c
++++ b/mstp.c
+@@ -998,6 +998,17 @@ int MSTP_IN_set_msti_bridge_config(tree_t *tree, __u8 bridge_priority)
+     return 0;
+ }
+ 
++int MSTP_IN_set_cist_bridge_priority(bridge_t *br, __u8 bridge_priority)
++{
++    int ret;
++
++    ret = MSTP_IN_set_msti_bridge_config(GET_CIST_TREE(br), bridge_priority);
++    if (!ret && br->bridgeEnabled)
++        br_state_machines_run(br);
++
++    return ret;
++}
++
+ /* 12.8.2.1 Read CIST Port Parameters */
+ void MSTP_IN_get_cist_port_status(port_t *prt, CIST_PortStatus *status)
+ {
+diff --git a/mstp.h b/mstp.h
+index 7929476..417d1b1 100644
+--- a/mstp.h
++++ b/mstp.h
+@@ -664,6 +664,7 @@ typedef struct
+ } CIST_BridgeConfig;
+ 
+ int MSTP_IN_set_cist_bridge_config(bridge_t *br, CIST_BridgeConfig *cfg);
++int MSTP_IN_set_cist_bridge_priority(bridge_t *br, __u8 bridge_priority);
+ 
+ /* 12.8.1.4 Set MSTI Bridge Protocol Parameters */
+     /* No need in special structure for single parameter Bridge Priority */
+diff --git a/netif_utils.c b/netif_utils.c
+index 2f4194f..5b35892 100644
+--- a/netif_utils.c
++++ b/netif_utils.c
+@@ -134,13 +134,16 @@ bool is_bridge(char *if_name)
+     return (0 == access(path, R_OK));
+ }
+ 
+-static int get_port_file(const char *if_name, const char *file)
++static int get_netdev_file(const char *if_name, const char *subdir,
++                           const char *file)
+ {
+-    char path[32 + IFNAMSIZ];
+-    sprintf(path, SYSFS_CLASS_NET "/%s/brport/%s", if_name, file);
++    char path[64 + IFNAMSIZ];
+     char buf[128];
+     int fd;
+     long res = -1;
++
++    snprintf(path, sizeof(path), SYSFS_CLASS_NET "/%s/%s/%s", if_name,
++             subdir, file);
+     TSTM((fd = open(path, O_RDONLY)) >= 0, -1, "%m");
+     int l;
+     if((l = read(fd, buf, sizeof(buf) - 1)) < 0) {
+@@ -174,10 +177,24 @@ out:
+ 
+ int get_bpdu_filter(char *if_name)
+ {
+-	return get_port_file(if_name, "bpdu_filter");
++	return get_netdev_file(if_name, "brport", "bpdu_filter");
+ }
+ 
+ int get_bridge_portno(char *if_name)
+ {
+-	return get_port_file(if_name, "port_no");
++	return get_netdev_file(if_name, "brport", "port_no");
++}
++
++int get_bridge_priority(char *if_name)
++{
++	int priority = get_netdev_file(if_name, "bridge", "priority");
++
++	if (priority < 0)
++		return -1;
++	if (priority > 61440 || priority % 4096) {
++		ERROR("Invalid bridge priority %d for %s", priority, if_name);
++		return -1;
++	}
++
++	return priority;
+ }
+diff --git a/netif_utils.h b/netif_utils.h
+index e68832a..4830a9f 100644
+--- a/netif_utils.h
++++ b/netif_utils.h
+@@ -40,5 +40,6 @@ bool is_bridge(char *if_name);
+ 
+ int get_bpdu_filter(char *if_name);
+ int get_bridge_portno(char *if_name);
++int get_bridge_priority(char *if_name);
+ 
+ #endif /* NETIF_UTILS_H */
+-- 
+2.55.0
+
