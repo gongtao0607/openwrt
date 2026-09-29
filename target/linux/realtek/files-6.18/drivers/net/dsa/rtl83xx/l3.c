@@ -990,17 +990,19 @@ static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64 mac)
 {
 	struct rtl838x_switch_priv *priv = ctrl->priv;
-	struct rhlist_head *tmp, *list;
 	struct otto_l3_route *r;
+	bool found = false;
 
-	rcu_read_lock();
-	list = rhltable_lookup(&ctrl->routes, &ip_addr, otto_l3_route_ht_params);
-	if (!list) {
-		rcu_read_unlock();
-		return -ENOENT;
-	}
+	/* The table writes below sleep, so this cannot walk the RCU hash list.
+	 * Every caller runs on the ordered priv->wq, which is what keeps the
+	 * route list from changing underneath.
+	 */
+	list_for_each_entry(r, &ctrl->routes_list, list) {
+		if (r->gw_ip != ip_addr)
+			continue;
 
-	rhl_for_each_entry_rcu(r, tmp, list, linkage) {
+		found = true;
+
 		dev_dbg(ctrl->dev, "%s: Setting up fwding: ip %pI4, GW mac %016llx\n",
 			__func__, &ip_addr, mac);
 
@@ -1078,9 +1080,8 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 			priv->r->pie_rule_write(priv, r->pr.id, &r->pr);
 		}
 	}
-	rcu_read_unlock();
 
-	return 0;
+	return found ? 0 : -ENOENT;
 }
 
 static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl,
