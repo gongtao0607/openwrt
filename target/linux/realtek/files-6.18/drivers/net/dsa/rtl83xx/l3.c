@@ -1025,6 +1025,8 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 		r->attr.action = ROUTE_ACT_FORWARD;
 		r->attr.type = ROUTE_TYPE_IP4UC;
 		r->attr.hit = false; /* Reset route-used indicator */
+		r->attr.ttl_dec = true;
+		r->attr.ttl_check = true;
 
 		/* Add PIE entry with dst_ip and prefix_len */
 		r->pr.dip = r->dst_ip;
