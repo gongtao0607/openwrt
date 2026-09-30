@@ -1,0 +1,2 @@
+# Announce routes the switch cannot offload (flag offload_failed)
+net.ipv4.fib_notify_on_flag_change=2

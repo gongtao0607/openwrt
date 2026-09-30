@@ -1,0 +1,44 @@
+#!/bin/sh /etc/rc.common
+
+START=19
+USE_PROCD=1
+
+apply() {
+	local attr on cur
+
+	attr=$(ls /sys/bus/platform/drivers/rtl83xx-switch/*/l3_offload 2>/dev/null | head -n 1)
+	[ -n "$attr" ] || return 0
+
+	case "$(uci -q get network.@globals[0].l3_offload)" in
+	1|on|true|yes|enabled) on=1 ;;
+	*) on=0 ;;
+	esac
+	cur=$(cat "$attr")
+
+	if [ "$on" = 1 ]; then
+		# The CPU forwards what the switch hands it: the first packets
+		# to a host being resolved, TTL expiry and other exceptions.
+		# IPv6 is not offloaded, so it is not routed at all.
+		sysctl -q -w net.ipv4.ip_forward=1
+		sysctl -q -w net.ipv6.conf.all.forwarding=0
+		sysctl -q -w net.ipv6.conf.default.forwarding=0
+	elif [ "$cur" = 1 ]; then
+		# Back to the forwarding the sysctl files ask for
+		/etc/init.d/sysctl restart
+	fi
+
+	[ "$cur" = "$on" ] && return 0
+	echo "$on" > "$attr" && logger -t realtek-l3 "switch routing $([ "$on" = 1 ] && echo on || echo off)"
+}
+
+start_service() {
+	apply
+}
+
+reload_service() {
+	apply
+}
+
+service_triggers() {
+	procd_add_reload_trigger network
+}
