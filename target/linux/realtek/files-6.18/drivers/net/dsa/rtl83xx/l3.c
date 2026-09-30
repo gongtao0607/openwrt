@@ -724,6 +724,59 @@ static bool otto_l3_dev_routed(struct otto_l3_ctrl *ctrl, struct net_device *dev
 	       otto_l3_port_dev_lower_find(dev, ctrl) >= 0;
 }
 
+/* Report in the FIB what the switch does with a route: forward it (offload),
+ * hand it to the CPU (trap), or nothing although it should (offload_failed).
+ * iproute2 shows these as flags of the route.
+ */
+static void otto_l3_fib_flags_set(struct fib_info *fi, u32 tb_id, __be32 dst, int dst_len,
+				  dscp_t dscp, u8 type, bool offload, bool trap, bool failed)
+{
+	struct fib_rt_info fri = {
+		.fi = fi,
+		.tb_id = tb_id,
+		.dst = dst,
+		.dst_len = dst_len,
+		.dscp = dscp,
+		.type = type,
+		.offload = offload,
+		.trap = trap,
+		.offload_failed = failed,
+	};
+
+	if (fi)
+		fib_alias_hw_flags_set(&init_net, &fri);
+}
+
+static void otto_l3_route_flags_set(struct otto_l3_route *r, bool offload, bool trap)
+{
+	otto_l3_fib_flags_set(r->fi, r->tb_id, r->dst_ip, r->prefix_len, r->dscp,
+			      r->fib_type, offload, trap, false);
+}
+
+/* Mark a neighbour as the one a host route in the switch forwards to */
+static void otto_l3_neigh_flags_set(int ifindex, __be32 ip_addr, bool offloaded)
+{
+	struct net_device *dev;
+	struct neighbour *n;
+
+	dev = dev_get_by_index(&init_net, ifindex);
+	if (!dev)
+		return;
+
+	n = neigh_lookup(&arp_tbl, &ip_addr, dev);
+	if (n) {
+		write_lock_bh(&n->lock);
+		if (offloaded)
+			n->flags |= NTF_OFFLOADED;
+		else
+			n->flags &= ~NTF_OFFLOADED;
+		write_unlock_bh(&n->lock);
+		neigh_release(n);
+	}
+
+	dev_put(dev);
+}
+
 /* On the RTL93xx a frame is only routed when its destination MAC and VLAN hit
  * an entry of the ROUTER_MAC table. A VLAN is routed as long as the switch
  * has an address in it, so the table holds one entry per VLAN of the local
@@ -1116,6 +1169,11 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 		if (ctrl->cfg->set_nexthop)
 			ctrl->cfg->set_nexthop(ctrl, r->nh.id, r->nh.l2_id, r->nh.if_id);
 
+		if (r->is_auto_host)
+			otto_l3_neigh_flags_set(r->ifindex, r->dst_ip, true);
+		else
+			otto_l3_route_flags_set(r, true, false);
+
 		if (ctrl->cfg->use_l3_tables)
 			continue;
 
@@ -1176,7 +1234,8 @@ static void otto_l3_nexthop_trap(struct otto_l3_ctrl *ctrl, __be32 ip_addr)
 			continue;
 
 		r->attr.action = ROUTE_ACT_TRAP2CPU;
-		otto_l3_route_rewrite(ctrl, r);
+		if (!otto_l3_route_rewrite(ctrl, r))
+			otto_l3_route_flags_set(r, false, true);
 	}
 }
 
@@ -1340,7 +1399,11 @@ static void otto_l3_route_teardown(struct otto_l3_ctrl *ctrl, struct otto_l3_rou
 	if (r->pr.id >= 0)
 		priv->r->pie_rule_rm(priv, &r->pr);
 
+	/* Nothing in the switch handles it any more */
+	if (r->is_auto_host)
+		otto_l3_neigh_flags_set(r->ifindex, r->dst_ip, false);
 	if (r->fi) {
+		otto_l3_route_flags_set(r, false, false);
 		fib_info_put(r->fi);
 		r->fi = NULL;
 	}
@@ -1530,6 +1593,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (otto_l3_route_rewrite(ctrl, route))
 		goto out_teardown;
 
+	otto_l3_route_flags_set(route, false, true);
 	if (local)
 		otto_l3_router_macs_update(ctrl);
 
@@ -1541,8 +1605,6 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (gw)
 		otto_l3_port_ipv4_resolve(ctrl, ndev, gw);
 
-	nh->fib_nh_flags |= RTNH_F_OFFLOAD;
-
 	return 0;
 
 out_teardown:
@@ -1550,12 +1612,13 @@ out_teardown:
 out_failed:
 	dev_warn(ctrl->dev, "route %pI4/%d on %s is not offloaded\n",
 		 &info->dst, info->dst_len, ndev->name);
+	otto_l3_fib_flags_set(info->fi, info->tb_id, info->dst, info->dst_len, info->dscp,
+			      info->type, false, false, true);
 	return 0;
 }
 
 static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
 {
-	struct fib_nh *nh = fib_info_nh(info->fi, 0);
 	struct otto_l3_route *route;
 	bool local;
 
@@ -1569,8 +1632,6 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	otto_l3_route_teardown(ctrl, route);
 	if (local)
 		otto_l3_router_macs_update(ctrl);
-
-	nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
 
 	return 0;
 }

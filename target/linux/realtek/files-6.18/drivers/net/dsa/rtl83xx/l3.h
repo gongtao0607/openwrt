@@ -82,7 +82,7 @@ struct otto_l3_route {
 	bool is_host_route;
 	bool is_auto_host;		/* host route made from a neighbour */
 	int ifindex;			/* L3 device the route leaves through */
-	/* The FIB entry the route mirrors */
+	/* The FIB entry the route mirrors, to report its offload state */
 	struct fib_info *fi;
 	dscp_t dscp;
 	u8 fib_type;
