@@ -123,6 +123,13 @@ struct otto_l3_ctrl {
 	unsigned long route_use_bm[MAX_ROUTES / 32];
 	unsigned long host_route_use_bm[MAX_HOST_ROUTES / 32];
 	struct otto_l3_intf interfaces[MAX_SMACS];
+	/* Whether the switch routes, see the l3_offload attribute. Only the
+	 * work on priv->wq reads and writes it, enable_req is what userspace
+	 * asked for.
+	 */
+	bool enabled;
+	bool enable_req;
+	struct work_struct enable_work;
 	struct mutex *lock; /* protect register access */
 };
 

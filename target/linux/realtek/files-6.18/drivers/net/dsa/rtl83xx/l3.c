@@ -1435,6 +1435,9 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	struct otto_l3_route *route;
 	int port;
 
+	if (!ctrl->enabled)
+		return 0;
+
 	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_ADD))
 		return 0;
 
@@ -1528,6 +1531,9 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	struct rhlist_head *tmp, *list;
 	struct otto_l3_route *route;
 	bool found = false;
+
+	if (!ctrl->enabled)
+		return 0;
 
 	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_DEL))
 		return 0;
@@ -1664,9 +1670,8 @@ static int otto_l3_fib_notifier(struct notifier_block *this, unsigned long event
 			 */
 			fib_info_hold(fib_work->fen_info.fi);
 
-		} else if (info->family == AF_INET6) {
-			//struct fib6_entry_notifier_info *fen6_info = ptr;
-			dev_warn(ctrl->dev, "FIB_RULE ADD/DEL for IPv6 not supported\n");
+		} else {
+			/* IPv6 and multicast routes are not offloaded */
 			kfree(fib_work);
 			return NOTIFY_DONE;
 		}
@@ -1674,6 +1679,10 @@ static int otto_l3_fib_notifier(struct notifier_block *this, unsigned long event
 
 	case FIB_EVENT_RULE_ADD:
 	case FIB_EVENT_RULE_DEL:
+		if (info->family != AF_INET) {
+			kfree(fib_work);
+			return NOTIFY_DONE;
+		}
 		dev_dbg(ctrl->dev, "FIB_RULE ADD/DEL, event: %ld\n", event);
 		memcpy(&fib_work->fr_info, ptr, sizeof(fib_work->fr_info));
 		fib_rule_get(fib_work->fr_info.rule);
@@ -2234,6 +2243,75 @@ static const struct file_operations otto_l3_930x_clear_hit_fops = {
 	.write = otto_l3_930x_clear_hit_write,
 };
 
+/* Turns routing in the switch on or off. Runs on priv->wq like the FIB and
+ * neighbour work, which is what serializes it against them.
+ */
+static void otto_l3_enable_work_do(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(work, struct otto_l3_ctrl, enable_work);
+	bool enable = READ_ONCE(ctrl->enable_req);
+	struct otto_l3_route *r, *tmp;
+	int err;
+
+	if (enable == ctrl->enabled)
+		return;
+	ctrl->enabled = enable;
+
+	if (!enable) {
+		list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list)
+			otto_l3_route_teardown(ctrl, r);
+		otto_l3_router_macs_update(ctrl);
+		dev_info(ctrl->dev, "L3 routing off\n");
+		return;
+	}
+
+	/* Take in the routes already there. Registering the FIB notifier
+	 * again replays the FIB; while routing was off its events were
+	 * ignored, so none are lost. It only queues work behind this one.
+	 */
+	dev_info(ctrl->dev, "L3 routing on\n");
+	unregister_fib_notifier(&init_net, &ctrl->fib_nb);
+	ctrl->fib_nb.notifier_call = otto_l3_fib_notifier;
+	err = register_fib_notifier(&init_net, &ctrl->fib_nb, NULL, NULL);
+	if (err) {
+		ctrl->fib_nb.notifier_call = NULL;
+		dev_err(ctrl->dev, "FIB replay failed, routes are not offloaded: %d\n", err);
+	}
+}
+
+/* 1 when the switch routes: every IPv4 route via a VLAN device on the switch
+ * that it can hold is forwarded by it, the rest is marked offload_failed.
+ */
+static ssize_t l3_offload_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl838x_switch_priv *priv = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(priv->l3_ctrl->enable_req));
+}
+
+static ssize_t l3_offload_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct rtl838x_switch_priv *priv = dev_get_drvdata(dev);
+	struct otto_l3_ctrl *ctrl = priv->l3_ctrl;
+	bool enable;
+	int err;
+
+	err = kstrtobool(buf, &enable);
+	if (err)
+		return err;
+
+	WRITE_ONCE(ctrl->enable_req, enable);
+
+	/* Return once the tables are cleared or the replay is queued */
+	queue_work(priv->wq, &ctrl->enable_work);
+	flush_work(&ctrl->enable_work);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(l3_offload);
+
 static void otto_l3_930x_dbgfs_remove(void *data)
 {
 	debugfs_remove_recursive(data);
@@ -2318,6 +2396,8 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 {
 	struct otto_l3_ctrl *ctrl = priv->l3_ctrl;
 
+	if (ctrl->enable_work.func)
+		device_remove_file(ctrl->dev, &dev_attr_l3_offload);
 	if (ctrl->ne_nb.notifier_call) {
 		unregister_netevent_notifier(&ctrl->ne_nb);
 		ctrl->ne_nb.notifier_call = NULL;
@@ -2325,6 +2405,14 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 	if (ctrl->fib_nb.notifier_call) {
 		unregister_fib_notifier(&init_net, &ctrl->fib_nb);
 		ctrl->fib_nb.notifier_call = NULL;
+	}
+	if (ctrl->enable_work.func) {
+		/* Nothing queues work any more. Turning routing off behind the
+		 * work already queued takes everything out of the switch.
+		 */
+		WRITE_ONCE(ctrl->enable_req, false);
+		queue_work(priv->wq, &ctrl->enable_work);
+		flush_workqueue(priv->wq);
 	}
 }
 
@@ -2357,6 +2445,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	/* Initialize hash table for L3 routing */
 	INIT_LIST_HEAD(&ctrl->routes_list);
 	rhltable_init(&ctrl->routes, &otto_l3_route_ht_params);
+	INIT_WORK(&ctrl->enable_work, otto_l3_enable_work_do);
 
 	/*
 	 * Register netevent notifier callback to catch notifications about neighboring changes
@@ -2384,6 +2473,12 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 
 	if (ctrl->cfg->dbgfs_init)
 		ctrl->cfg->dbgfs_init(ctrl);
+
+	if (ctrl->cfg->setup) {
+		err = device_create_file(ctrl->dev, &dev_attr_l3_offload);
+		if (err)
+			dev_warn(dev, "no l3_offload attribute, the switch does not route: %d\n", err);
+	}
 
 	return 0;
 }
