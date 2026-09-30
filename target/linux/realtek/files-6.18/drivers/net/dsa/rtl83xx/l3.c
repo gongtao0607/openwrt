@@ -17,12 +17,6 @@
 #include "l3.h"
 #include "rtl-otto.h"
 
-static const struct rhashtable_params otto_l3_route_ht_params = {
-	.key_len     = sizeof(u32),
-	.key_offset  = offsetof(struct otto_l3_route, gw_ip),
-	.head_offset = offsetof(struct otto_l3_route, linkage),
-};
-
 struct otto_l3_net_event_work {
 	struct work_struct work;
 	struct otto_l3_ctrl *ctrl;
@@ -1279,9 +1273,6 @@ static void otto_l3_route_remove(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 {
 	int id;
 
-	if (rhltable_remove(&ctrl->routes, &r->linkage, otto_l3_route_ht_params))
-		dev_warn(ctrl->dev, "Could not remove route\n");
-
 	if (r->is_host_route) {
 		id = ctrl->cfg->find_slot(ctrl, r, true);
 		if (id >= 0) {
@@ -1361,7 +1352,7 @@ static void otto_l3_route_teardown(struct otto_l3_ctrl *ctrl, struct otto_l3_rou
 static struct otto_l3_route *otto_l3_host_route_alloc(struct otto_l3_ctrl *ctrl, u32 ip)
 {
 	struct otto_l3_route *r;
-	int idx = 0, err;
+	int idx;
 
 	mutex_lock(ctrl->lock);
 
@@ -1391,30 +1382,18 @@ static struct otto_l3_route *otto_l3_host_route_alloc(struct otto_l3_ctrl *ctrl,
 	r->pr.packet_cntr = -1;
 	r->is_host_route = true;
 
-	err = rhltable_insert(&ctrl->routes, &r->linkage, otto_l3_route_ht_params);
-	if (err) {
-		dev_err(ctrl->dev, "Could not insert new rule\n");
-		mutex_unlock(ctrl->lock);
-		goto out_free;
-	}
-
 	list_add_tail(&r->list, &ctrl->routes_list);
 	set_bit(idx, ctrl->host_route_use_bm);
 
 	mutex_unlock(ctrl->lock);
 
 	return r;
-
-out_free:
-	kfree(r);
-
-	return NULL;
 }
 
 static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl, u32 ip)
 {
 	struct otto_l3_route *r;
-	int idx = 0, err;
+	int idx;
 
 	mutex_lock(ctrl->lock);
 
@@ -1440,24 +1419,12 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl, u32 
 	r->pr.packet_cntr = -1;
 	r->is_host_route = false;
 
-	err = rhltable_insert(&ctrl->routes, &r->linkage, otto_l3_route_ht_params);
-	if (err) {
-		dev_err(ctrl->dev, "Could not insert new rule\n");
-		mutex_unlock(ctrl->lock);
-		goto out_free;
-	}
-
 	list_add_tail(&r->list, &ctrl->routes_list);
 	set_bit(idx, ctrl->route_use_bm);
 
 	mutex_unlock(ctrl->lock);
 
 	return r;
-
-out_free:
-	kfree(r);
-
-	return NULL;
 }
 
 /* Whether the switch can do what the kernel does with this route */
@@ -2487,9 +2454,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 			return dev_err_probe(dev, err, "device specific L3 setup failed\n");
 	}
 
-	/* Initialize hash table for L3 routing */
 	INIT_LIST_HEAD(&ctrl->routes_list);
-	rhltable_init(&ctrl->routes, &otto_l3_route_ht_params);
 	INIT_WORK(&ctrl->enable_work, otto_l3_enable_work_do);
 
 	/*

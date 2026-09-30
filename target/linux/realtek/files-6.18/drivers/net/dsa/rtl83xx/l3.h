@@ -87,7 +87,6 @@ struct otto_l3_route {
 	u8 fib_type;
 	int id;				/* ID number of this route */
 	int row;			/* Row it occupies in the prefix route table */
-	struct rhlist_head linkage;
 	struct list_head list;		/* all routes, for lookups by destination */
 	u32 tb_id;			/* routing table the route came from */
 	u16 switch_mac_id;		/* Index into switch's own MACs, RTL839X only */
@@ -127,7 +126,6 @@ struct otto_l3_ctrl {
 	struct rtl838x_switch_priv *priv;
 	struct notifier_block fib_nb;
 	struct notifier_block ne_nb;
-	struct rhltable routes;
 	struct list_head routes_list;
 	unsigned long route_use_bm[MAX_ROUTES / 32];
 	unsigned long host_route_use_bm[MAX_HOST_ROUTES / 32];
