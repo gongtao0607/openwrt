@@ -338,6 +338,7 @@ static void otto_l3_930x_get_router_mac(struct otto_l3_ctrl *ctrl,
 	m->p_id = (v >> 13) & 0x3f;  /* trunk id of port */
 	m->vid = v & 0xfff;
 	m->vid_mask = w & 0xfff;
+	m->p_id_mask = (w >> 13) & 0x3f;
 	m->action = data[6] & 0x7;
 	m->mac_mask = ((((u64)data[4]) << 32) & 0xffffffffffffULL) | data[5];
 	m->mac = ((((u64)data[1]) << 32) & 0xffffffffffffULL) | data[2];
@@ -703,6 +704,14 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 {
 	struct otto_l3_walk_data data;
 	struct netdev_nested_priv _priv;
+	int port;
+
+	if (!dev)
+		return -EINVAL;
+
+	port = rtl83xx_port_is_under(dev, ctrl->priv);
+	if (port >= 0)
+		return port;
 
 	data.ctrl = ctrl;
 	data.port = -EINVAL;
@@ -715,13 +724,28 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 	return data.port;
 }
 
+static int otto_l3_dev_vid(struct otto_l3_ctrl *ctrl, struct net_device *dev)
+{
+	int port;
+
+	if (is_vlan_dev(dev))
+		return vlan_dev_vlan_id(dev);
+
+	port = otto_l3_port_dev_lower_find(dev, ctrl);
+	if (port >= 0)
+		return ctrl->priv->ports[port].pvid;
+
+	return 0;
+}
+
 /* Whether the switch routes for this L3 device: routing is on and the device
- * is a VLAN on the switch. Those are the devices a router MAC can be set up
- * for, one per VLAN.
+ * is a VLAN on the switch or a standalone switch port. Those are the devices a
+ * router MAC can be set up for.
  */
 static bool otto_l3_dev_routed(struct otto_l3_ctrl *ctrl, struct net_device *dev)
 {
-	return ctrl->enabled && dev && is_vlan_dev(dev) &&
+	return ctrl->enabled && dev &&
+	       (is_vlan_dev(dev) || rtl83xx_port_is_under(dev, ctrl->priv) >= 0) &&
 	       otto_l3_port_dev_lower_find(dev, ctrl) >= 0;
 }
 
@@ -789,6 +813,8 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 	DECLARE_BITMAP(have, MAX_ROUTER_MACS) = {};
 	u64 macs[MAX_ROUTER_MACS];
 	u16 vids[MAX_ROUTER_MACS];
+	u8 ports[MAX_ROUTER_MACS];
+	bool is_port[MAX_ROUTER_MACS];
 	struct otto_l3_router_mac m;
 	struct otto_l3_route *r;
 	int i, j, n = 0;
@@ -797,19 +823,45 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 		return;
 
 	list_for_each_entry(r, &ctrl->routes_list, list) {
-		if (r->tb_id != RT_TABLE_LOCAL || !r->nh.rvid)
+		struct net_device *dev;
+		bool vlan;
+		int port;
+
+		if (r->tb_id != RT_TABLE_LOCAL)
 			continue;
-		for (j = 0; j < n; j++)
-			if (macs[j] == r->nh.mac && vids[j] == r->nh.rvid)
+
+		dev = dev_get_by_index(&init_net, r->ifindex);
+		if (!dev)
+			continue;
+
+		vlan = is_vlan_dev(dev);
+		port = otto_l3_port_dev_lower_find(dev, ctrl);
+		dev_put(dev);
+
+		if (port < 0)
+			continue;
+
+		for (j = 0; j < n; j++) {
+			if (macs[j] != r->nh.mac)
+				continue;
+			if (vlan && !is_port[j] && vids[j] == r->nh.rvid)
 				break;
+			if (!vlan && is_port[j] && ports[j] == port)
+				break;
+		}
 		if (j < n)
 			continue;
+
 		if (n == MAX_ROUTER_MACS) {
-			dev_err(ctrl->dev, "more routed VLANs than router MACs\n");
+			dev_err(ctrl->dev, "more routed interfaces than router MACs\n");
 			break;
 		}
+
 		macs[n] = r->nh.mac;
-		vids[n++] = r->nh.rvid;
+		vids[n] = r->nh.rvid;
+		ports[n] = port;
+		is_port[n] = !vlan;
+		n++;
 	}
 
 	mutex_lock(ctrl->lock);
@@ -820,9 +872,17 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 		ctrl->cfg->get_router_mac(ctrl, i, &m);
 		if (!m.valid)
 			continue;
-		for (j = 0; j < n; j++)
-			if (m.mac == macs[j] && m.vid == vids[j] && m.vid_mask == 0xfff)
-				break;
+		for (j = 0; j < n; j++) {
+			if (m.mac != macs[j])
+				continue;
+			if (!is_port[j]) {
+				if (m.p_id_mask == 0 && m.vid_mask == 0xfff && m.vid == vids[j])
+					break;
+			} else {
+				if (m.p_id_mask == 0x3f && m.p_id == ports[j] && m.vid_mask == 0)
+					break;
+			}
+		}
 		if (j < n && !test_and_set_bit(j, have))
 			continue;
 		m.valid = false;
@@ -840,20 +900,29 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 				break;
 		}
 		if (i == MAX_ROUTER_MACS) {
-			dev_err(ctrl->dev, "No free router MACs, VLAN %d is not routed\n", vids[j]);
+			dev_err(ctrl->dev, "No free router MACs\n");
 			break;
 		}
 
 		memset(&m, 0, sizeof(m));
 		m.valid = true;
 		m.mac = macs[j];
-		m.p_type = 0;			/* An individual port, not a trunk port */
-		m.p_id = 0x3f;			/* Listen on any port */
-		m.p_id_mask = 0;
-		m.vid = vids[j];		/* ... but only in this VLAN */
-		m.vid_mask = 0xfff;
-		m.mac_mask = 0xffffffffffffULL;	/* We want an exact match of the interface MAC */
-		m.action = L3_FORWARD;		/* Route the packet */
+		m.mac_mask = 0xffffffffffffULL;
+		m.action = L3_FORWARD;
+		m.p_type = 0;
+
+		if (!is_port[j]) {
+			m.p_id = 0x3f;
+			m.p_id_mask = 0;
+			m.vid = vids[j];
+			m.vid_mask = 0xfff;
+		} else {
+			m.p_id = ports[j];
+			m.p_id_mask = 0x3f;
+			m.vid = 0;
+			m.vid_mask = 0;
+		}
+
 		ctrl->cfg->set_router_mac(ctrl, i, &m);
 		i++;
 	}
@@ -1576,7 +1645,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	route->fib_type = info->type;
 
 	mac = ether_addr_to_u64(ndev->dev_addr);
-	route->nh.rvid = vlan_dev_vlan_id(ndev);
+	route->nh.rvid = otto_l3_dev_vid(ctrl, ndev);
 	route->nh.mac = mac;
 	route->nh.port = priv->r->port_ignore;
 	route->nh.id = route->id;
@@ -1877,7 +1946,7 @@ static int otto_l3_auto_host_route_add(struct otto_l3_ctrl *ctrl, struct net_dev
 	r->is_auto_host = true;
 	r->ifindex = dev->ifindex;
 	r->attr.type = ROUTE_TYPE_IP4UC;
-	r->nh.rvid = vlan_dev_vlan_id(dev);
+	r->nh.rvid = otto_l3_dev_vid(ctrl, dev);
 	r->nh.port = priv->r->port_ignore;
 	r->nh.id = r->id;
 	r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, dev_mac, r->nh.rvid);
