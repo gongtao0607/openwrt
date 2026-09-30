@@ -846,7 +846,10 @@ static int otto_l3_930x_setup(struct otto_l3_ctrl *ctrl)
 	pr_debug("L3_IPUC_ROUTE_CTRL %08x, IPMC_ROUTE %08x, IP6UC_ROUTE %08x, IP6MC_ROUTE %08x\n",
 		 sw_r32(RTL930X_L3_IPUC_ROUTE_CTRL), sw_r32(RTL930X_L3_IPMC_ROUTE_CTRL),
 		 sw_r32(RTL930X_L3_IP6UC_ROUTE_CTRL), sw_r32(RTL930X_L3_IP6MC_ROUTE_CTRL));
-	sw_w32(0x00002001, RTL930X_L3_IPUC_ROUTE_CTRL);
+	/* Packets whose TTL runs out go to the CPU, which answers them with
+	 * an ICMP time exceeded: TTL_FAIL_ACT, bit 17, is 1 (trap).
+	 */
+	sw_w32(0x00022001, RTL930X_L3_IPUC_ROUTE_CTRL);
 	sw_w32(0x00014581, RTL930X_L3_IP6UC_ROUTE_CTRL);
 	sw_w32(0x00000501, RTL930X_L3_IPMC_ROUTE_CTRL);
 	sw_w32(0x00012881, RTL930X_L3_IP6MC_ROUTE_CTRL);
