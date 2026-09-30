@@ -24,6 +24,7 @@ struct otto_l3_net_event_work {
 	u64 mac;
 	u32 ip_addr;
 	bool valid;
+	bool failed;
 };
 
 struct otto_l3_fib_event_work {
@@ -1771,6 +1772,78 @@ static struct otto_l3_route *otto_l3_find_auto_host_route(struct otto_l3_ctrl *c
 	return NULL;
 }
 
+/* How long a host that did not answer ARP is dropped in the switch */
+#define OTTO_L3_NEGATIVE_TIME	(30 * HZ)
+
+/*
+ * Packets for a host that is not resolved yet are trapped to the CPU, which
+ * resolves it. Once resolving fails, the host's packets are dropped in the
+ * switch for a while instead. Otherwise a stream to an address nobody has
+ * keeps the rate limited CPU queue of these traps full, and the first packets
+ * to hosts that are there could not get through to be resolved.
+ */
+static void otto_l3_negative_add(struct otto_l3_ctrl *ctrl, struct net_device *dev,
+				 __be32 ip_addr)
+{
+	struct rtl838x_switch_priv *priv = ctrl->priv;
+	struct otto_l3_route *r;
+
+	if (ipv4_is_multicast(ip_addr) || ipv4_is_lbcast(ip_addr) || ipv4_is_zeronet(ip_addr))
+		return;
+
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->is_host_route && r->dst_ip == ip_addr)
+			return;
+
+	/* No gateway, so that resolving the host later does not touch it */
+	r = otto_l3_host_route_alloc(ctrl, 0);
+	if (!r)
+		return;
+
+	r->dst_ip = ip_addr;
+	r->prefix_len = 32;
+	r->tb_id = RT_TABLE_MAIN;
+	r->is_auto_host = true;
+	r->is_negative = true;
+	r->expires = jiffies + OTTO_L3_NEGATIVE_TIME;
+	r->ifindex = dev->ifindex;
+	r->nh.port = priv->r->port_ignore;
+	r->nh.id = r->id;
+	r->attr.valid = true;
+	r->attr.type = ROUTE_TYPE_IP4UC;
+	r->attr.action = ROUTE_ACT_DROP;
+	if (otto_l3_route_rewrite(ctrl, r)) {
+		otto_l3_route_teardown(ctrl, r);
+		return;
+	}
+
+	dev_dbg(ctrl->dev, "host %pI4 did not answer, dropped for a while\n", &ip_addr);
+	queue_delayed_work(priv->wq, &ctrl->negative_work, OTTO_L3_NEGATIVE_TIME);
+}
+
+static void otto_l3_negative_work_do(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(to_delayed_work(work), struct otto_l3_ctrl,
+						 negative_work);
+	unsigned long next = 0;
+	struct otto_l3_route *r, *tmp;
+
+	list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list) {
+		if (!r->is_negative)
+			continue;
+		if (time_after_eq(jiffies, r->expires))
+			otto_l3_route_teardown(ctrl, r);
+		else if (!next || time_before(r->expires, next))
+			next = r->expires;
+	}
+
+	if (next) {
+		unsigned long delay = time_after(next, jiffies) ? next - jiffies : 0;
+
+		queue_delayed_work(ctrl->priv->wq, &ctrl->negative_work, delay);
+	}
+}
+
 /* A resolved neighbour on a routed device becomes a host route to itself,
  * which otto_l3_nexthop_update() then forwards like any route via a gateway.
  * The switch's own addresses and host routes from the FIB keep their entries.
@@ -1784,6 +1857,10 @@ static int otto_l3_auto_host_route_add(struct otto_l3_ctrl *ctrl, struct net_dev
 
 	if (ipv4_is_multicast(ip_addr) || ipv4_is_lbcast(ip_addr) || ipv4_is_zeronet(ip_addr))
 		return 0;
+
+	r = otto_l3_find_auto_host_route(ctrl, ip_addr);
+	if (r && r->is_negative)
+		otto_l3_route_teardown(ctrl, r);
 
 	list_for_each_entry(r, &ctrl->routes_list, list)
 		if (r->is_host_route && r->dst_ip == ip_addr)
@@ -1841,6 +1918,8 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 	} else {
 		otto_l3_nexthop_trap(ctrl, net_work->ip_addr);
 		otto_l3_auto_host_route_del(ctrl, dev, net_work->ip_addr);
+		if (net_work->failed && otto_l3_dev_routed(ctrl, dev))
+			otto_l3_negative_add(ctrl, dev, net_work->ip_addr);
 	}
 
 	dev_put(dev);
@@ -1870,6 +1949,7 @@ static void otto_l3_neigh_queue(struct otto_l3_ctrl *ctrl, struct neighbour *n)
 	 * which resolves it anew.
 	 */
 	net_work->valid = (state & NUD_VALID) && !dead;
+	net_work->failed = (state & NUD_FAILED) && !dead;
 	net_work->mac = ether_addr_to_u64(ha);
 	net_work->ip_addr = *(__be32 *)n->primary_key;
 
@@ -2573,6 +2653,7 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 		WRITE_ONCE(ctrl->enable_req, false);
 		queue_work(priv->wq, &ctrl->enable_work);
 		flush_workqueue(priv->wq);
+		cancel_delayed_work_sync(&ctrl->negative_work);
 	}
 }
 
@@ -2604,6 +2685,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 
 	INIT_LIST_HEAD(&ctrl->routes_list);
 	INIT_WORK(&ctrl->enable_work, otto_l3_enable_work_do);
+	INIT_DELAYED_WORK(&ctrl->negative_work, otto_l3_negative_work_do);
 
 	/*
 	 * Register netevent notifier callback to catch notifications about neighboring changes

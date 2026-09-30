@@ -81,6 +81,8 @@ struct otto_l3_route {
 	int prefix_len;			/* Network prefix len of the destination net */
 	bool is_host_route;
 	bool is_auto_host;		/* host route made from a neighbour */
+	bool is_negative;		/* ... that failed to resolve: dropped */
+	unsigned long expires;		/* when a negative entry goes */
 	int ifindex;			/* L3 device the route leaves through */
 	/* The FIB entry the route mirrors, to report its offload state */
 	struct fib_info *fi;
@@ -138,6 +140,7 @@ struct otto_l3_ctrl {
 	bool enabled;
 	bool enable_req;
 	struct work_struct enable_work;
+	struct delayed_work negative_work;
 	struct mutex *lock; /* protect register access */
 };
 
