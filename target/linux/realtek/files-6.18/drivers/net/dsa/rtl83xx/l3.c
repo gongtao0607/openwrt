@@ -711,7 +711,9 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 	data.port = -EINVAL;
 	_priv.data = (void *)&data;
 
-	netdev_walk_all_lower_dev(dev, otto_l3_port_lower_walk, &_priv);
+	rcu_read_lock();
+	netdev_walk_all_lower_dev_rcu(dev, otto_l3_port_lower_walk, &_priv);
+	rcu_read_unlock();
 
 	return data.port;
 }
