@@ -27,7 +27,8 @@ struct otto_l3_net_event_work {
 	struct work_struct work;
 	struct otto_l3_ctrl *ctrl;
 	u64 mac;
-	u32 gw_addr;
+	u32 ip_addr;
+	bool valid;
 };
 
 struct otto_l3_fib_event_work {
@@ -718,6 +719,16 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 	return data.port;
 }
 
+/* Whether the switch routes for this L3 device: routing is on and the device
+ * is a VLAN on the switch. Those are the devices a router MAC can be set up
+ * for, one per VLAN.
+ */
+static bool otto_l3_dev_routed(struct otto_l3_ctrl *ctrl, struct net_device *dev)
+{
+	return ctrl->enabled && dev && is_vlan_dev(dev) &&
+	       otto_l3_port_dev_lower_find(dev, ctrl) >= 0;
+}
+
 /* On the RTL93xx a frame is only routed when its destination MAC and VLAN hit
  * an entry of the ROUTER_MAC table. A VLAN is routed as long as the switch
  * has an address in it, so the table holds one entry per VLAN of the local
@@ -1043,6 +1054,9 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 	 * route list from changing underneath.
 	 */
 	list_for_each_entry(r, &ctrl->routes_list, list) {
+		/* Routes via this gateway, including those still trapping
+		 * because it was not resolved yet.
+		 */
 		if (r->gw_ip != ip_addr)
 			continue;
 
@@ -1129,6 +1143,45 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 	}
 
 	return found ? 0 : -ENOENT;
+}
+
+/* Write a route's entry as it stands, where it already is */
+static int otto_l3_route_rewrite(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
+{
+	int slot;
+
+	if (r->is_host_route) {
+		slot = ctrl->cfg->find_slot(ctrl, r, true);
+		if (slot < 0)
+			slot = ctrl->cfg->find_slot(ctrl, r, false);
+		if (slot < 0)
+			return -ENOSPC;
+		ctrl->cfg->host_route_write(ctrl, slot, r);
+		return 0;
+	}
+
+	if (r->row < 0)
+		r->row = otto_l3_route_place(ctrl, r);
+	if (r->row < 0)
+		return -ENOSPC;
+	ctrl->cfg->route_write(ctrl, r->row, r);
+	return 0;
+}
+
+/* The gateway can no longer be reached: hand the routes via it to the CPU,
+ * which resolves it again or answers with an ICMP error.
+ */
+static void otto_l3_nexthop_trap(struct otto_l3_ctrl *ctrl, __be32 ip_addr)
+{
+	struct otto_l3_route *r;
+
+	list_for_each_entry(r, &ctrl->routes_list, list) {
+		if (r->gw_ip != ip_addr || r->attr.action == ROUTE_ACT_TRAP2CPU)
+			continue;
+
+		r->attr.action = ROUTE_ACT_TRAP2CPU;
+		otto_l3_route_rewrite(ctrl, r);
+	}
 }
 
 static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl,
@@ -1376,7 +1429,7 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl, u32 
 	}
 
 	r->id = idx;
-	r->row = -1;			/* placed when the gateway resolves */
+	r->row = -1;			/* placed when it is first written */
 	r->gw_ip = ip;
 	r->pr.id = -1; /* We still need to allocate a rule in HW */
 	r->pr.packet_cntr = -1;
@@ -1429,22 +1482,23 @@ static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
 static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
 {
 	struct net_device *ndev = fib_info_nh(info->fi, 0)->fib_nh_dev;
-	int vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
 	struct rtl838x_switch_priv *priv = ctrl->priv;
 	struct fib_nh *nh = fib_info_nh(info->fi, 0);
+	bool local = info->type == RTN_LOCAL;
+	__be32 gw = nh->fib_nh_gw4;
 	struct otto_l3_route *route;
-	int port;
+	u64 mac;
 
-	if (!ctrl->enabled)
+	if (!ctrl->enabled || !ndev || otto_l3_port_dev_lower_find(ndev, ctrl) < 0)
 		return 0;
 
 	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_ADD))
 		return 0;
 
-	port = otto_l3_port_dev_lower_find(ndev, ctrl);
-	if (port < 0) {
-		dev_err(ctrl->dev, "lower interface %s not found\n", ndev->name);
-		return -ENODEV;
+	if (!otto_l3_dev_routed(ctrl, ndev)) {
+		dev_warn(ctrl->dev, "route %pI4/%d on %s is not offloaded\n",
+			 &info->dst, info->dst_len, ndev->name);
+		return 0;
 	}
 
 	/* Every add that reaches the driver arrives as a replace, so a route
@@ -1458,70 +1512,56 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 		otto_l3_route_teardown(ctrl, route);
 	}
 
-	/* Allocate route or host-route entry (if hardware supports this) */
-	if (info->dst_len == 32 && ctrl->cfg->host_route_write)
-		route = otto_l3_host_route_alloc(ctrl, nh->fib_nh_gw4);
+	/* The switch's own addresses and routes via a gateway go to the host
+	 * table when they are single addresses. Directly connected subnets,
+	 * even single addresses, go to the prefix table: the host table is
+	 * where the neighbours in them go.
+	 */
+	if (info->dst_len == 32 && (local || gw) && ctrl->cfg->host_route_write)
+		route = otto_l3_host_route_alloc(ctrl, gw);
 	else
-		route = otto_l3_route_alloc(ctrl, nh->fib_nh_gw4);
-
-	if (route)
-		dev_info(ctrl->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);
-	else {
-		dev_err(ctrl->dev, "could not extend route hashtable for gw %pI4\n",
-			&nh->fib_nh_gw4);
+		route = otto_l3_route_alloc(ctrl, gw);
+	if (!route) {
+		dev_err(ctrl->dev, "no room for route %pI4/%d\n", &info->dst, info->dst_len);
 		return -ENOSPC;
 	}
 
 	route->dst_ip = info->dst;
 	route->prefix_len = info->dst_len;
 	route->tb_id = info->tb_id;
+
+	mac = ether_addr_to_u64(ndev->dev_addr);
+	route->nh.rvid = vlan_dev_vlan_id(ndev);
+	route->nh.mac = mac;
+	route->nh.port = priv->r->port_ignore;
+	route->nh.id = route->id;
+	route->nh.if_id = otto_l3_alloc_egress_intf(ctrl, mac, route->nh.rvid);
+	if (route->nh.if_id < 0)
+		goto out_teardown;
+
+	/* Until there is somewhere to forward to, the CPU takes the packets:
+	 * those for the switch itself, those for hosts on a connected subnet
+	 * that are not resolved yet, and those via a gateway that is not.
+	 */
+	route->attr.valid = true;
 	route->attr.type = ROUTE_TYPE_IP4UC;
-	route->nh.rvid = vlan;
+	route->attr.action = ROUTE_ACT_TRAP2CPU;
+	if (otto_l3_route_rewrite(ctrl, route))
+		goto out_teardown;
 
-	if (ctrl->cfg->set_router_mac) {
-		u64 mac = ether_addr_to_u64(ndev->dev_addr);
-
-		route->nh.if_id = otto_l3_alloc_egress_intf(ctrl, mac, vlan);
-		if (route->nh.if_id < 0)
-			goto out_free_rt;
-
-		if (!nh->fib_nh_gw4 && route->is_host_route) {
-			int slot;
-
-			route->nh.mac = mac;
-			route->nh.port = priv->r->port_ignore;
-			route->attr.valid = true;
-			route->attr.action = ROUTE_ACT_TRAP2CPU;
-			route->attr.type = ROUTE_TYPE_IP4UC;
-
-			slot = ctrl->cfg->find_slot(ctrl, route, true);
-			if (slot < 0)
-				slot = ctrl->cfg->find_slot(ctrl, route, false);
-
-			if (slot < 0) {
-				dev_err(ctrl->dev, "no slot for host route %pI4\n",
-					&route->dst_ip);
-				goto out_free_rt;
-			}
-
-			dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
-			ctrl->cfg->host_route_write(ctrl, slot, route);
-		}
-	}
-
-	/* An address of the switch: route in its VLAN */
-	if (info->tb_id == RT_TABLE_LOCAL)
+	if (local)
 		otto_l3_router_macs_update(ctrl);
 
-	/* We need to resolve the mac address of the GW */
-	if (nh->fib_nh_gw4)
-		otto_l3_port_ipv4_resolve(ctrl, ndev, nh->fib_nh_gw4);
+	/* Forward in the switch once the gateway is resolved */
+	if (gw)
+		otto_l3_port_ipv4_resolve(ctrl, ndev, gw);
 
 	nh->fib_nh_flags |= RTNH_F_OFFLOAD;
 
 	return 0;
 
-out_free_rt:
+out_teardown:
+	otto_l3_route_teardown(ctrl, route);
 	return 0;
 }
 
@@ -1698,20 +1738,47 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_net_event_work *net_work =
 		container_of(work, struct otto_l3_net_event_work, work);
+	struct otto_l3_ctrl *ctrl = net_work->ctrl;
 
-	otto_l3_nexthop_update(net_work->ctrl, net_work->gw_addr, net_work->mac);
+	if (net_work->valid)
+		otto_l3_nexthop_update(ctrl, net_work->ip_addr, net_work->mac);
+	else
+		otto_l3_nexthop_trap(ctrl, net_work->ip_addr);
 
 	kfree(net_work);
+}
+
+/* Called with the neighbour table or the neighbour locked, so it only queues */
+static void otto_l3_neigh_queue(struct otto_l3_ctrl *ctrl, struct neighbour *n)
+{
+	struct otto_l3_net_event_work *net_work;
+	u8 state = READ_ONCE(n->nud_state);
+	bool dead = READ_ONCE(n->dead);
+	u8 ha[ETH_ALEN];
+
+	net_work = kzalloc(sizeof(*net_work), GFP_ATOMIC);
+	if (!net_work)
+		return;
+
+	neigh_ha_snapshot(ha, n, n->dev);
+
+	INIT_WORK(&net_work->work, otto_l3_net_event_work_do);
+	net_work->ctrl = ctrl;
+	/* A flushed or collected entry is marked dead but may keep a valid
+	 * state. Once it is gone, packets for the host trap to the CPU again,
+	 * which resolves it anew.
+	 */
+	net_work->valid = (state & NUD_VALID) && !dead;
+	net_work->mac = ether_addr_to_u64(ha);
+	net_work->ip_addr = *(__be32 *)n->primary_key;
+
+	queue_work(ctrl->priv->wq, &net_work->work);
 }
 
 static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long event, void *ptr)
 {
 	struct otto_l3_ctrl *ctrl = container_of(this, struct otto_l3_ctrl, ne_nb);
-	struct rtl838x_switch_priv *priv = ctrl->priv;
-	struct otto_l3_net_event_work *net_work;
 	struct neighbour *n = ptr;
-	struct net_device *dev;
-	int err, port;
 
 	switch (event) {
 	case NETEVENT_NEIGH_UPDATE:
@@ -1721,28 +1788,10 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 
 		if (n->tbl != &arp_tbl)
 			return NOTIFY_DONE;
-		dev = n->dev;
-		port = otto_l3_port_dev_lower_find(dev, ctrl);
-		if (port < 0 || !(n->nud_state & NUD_VALID)) {
-			dev_dbg(ctrl->dev, "Neigbour invalid, not updating\n");
+		if (otto_l3_port_dev_lower_find(n->dev, ctrl) < 0)
 			return NOTIFY_DONE;
-		}
 
-		net_work = kzalloc(sizeof(*net_work), GFP_ATOMIC);
-		if (!net_work)
-			return NOTIFY_BAD;
-
-		INIT_WORK(&net_work->work, otto_l3_net_event_work_do);
-		net_work->ctrl = ctrl;
-
-		net_work->mac = ether_addr_to_u64(n->ha);
-		net_work->gw_addr = *(__be32 *)n->primary_key;
-
-		dev_dbg(ctrl->dev, "updating neighbour on port %d, mac %016llx\n",
-			port, net_work->mac);
-		queue_work(priv->wq, &net_work->work);
-		if (err)
-			netdev_warn(dev, "failed to handle neigh update (err %d)\n", err);
+		otto_l3_neigh_queue(ctrl, n);
 		break;
 	}
 
