@@ -20,6 +20,7 @@
 struct otto_l3_net_event_work {
 	struct work_struct work;
 	struct otto_l3_ctrl *ctrl;
+	struct net_device *dev;
 	u64 mac;
 	u32 ip_addr;
 	bool valid;
@@ -1170,7 +1171,8 @@ static void otto_l3_nexthop_trap(struct otto_l3_ctrl *ctrl, __be32 ip_addr)
 	struct otto_l3_route *r;
 
 	list_for_each_entry(r, &ctrl->routes_list, list) {
-		if (r->gw_ip != ip_addr || r->attr.action == ROUTE_ACT_TRAP2CPU)
+		if (r->gw_ip != ip_addr || r->is_auto_host ||
+		    r->attr.action == ROUTE_ACT_TRAP2CPU)
 			continue;
 
 		r->attr.action = ROUTE_ACT_TRAP2CPU;
@@ -1467,7 +1469,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	 */
 	route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst, NULL,
 				   info->dst_len);
-	if (route && route->fi == info->fi) {
+	if (route && !route->is_auto_host && route->fi == info->fi) {
 		if (gw)
 			otto_l3_port_ipv4_resolve(ctrl, ndev, gw);
 		return 0;
@@ -1559,7 +1561,7 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst, NULL,
 				   info->dst_len);
-	if (!route || route->fi != info->fi)
+	if (!route || route->is_auto_host || route->fi != info->fi)
 		return 0;
 
 	dev_info(ctrl->dev, "removing %pI4/%d (id %d)\n", &info->dst, info->dst_len, route->id);
@@ -1697,17 +1699,90 @@ static int otto_l3_fib_notifier(struct notifier_block *this, unsigned long event
 	return NOTIFY_DONE;
 }
 
+static struct otto_l3_route *otto_l3_find_auto_host_route(struct otto_l3_ctrl *ctrl, __be32 ip_addr)
+{
+	struct otto_l3_route *r;
+
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->is_auto_host && r->dst_ip == ip_addr)
+			return r;
+
+	return NULL;
+}
+
+/* A resolved neighbour on a routed device becomes a host route to itself,
+ * which otto_l3_nexthop_update() then forwards like any route via a gateway.
+ * The switch's own addresses and host routes from the FIB keep their entries.
+ */
+static int otto_l3_auto_host_route_add(struct otto_l3_ctrl *ctrl, struct net_device *dev,
+				       __be32 ip_addr)
+{
+	struct rtl838x_switch_priv *priv = ctrl->priv;
+	struct otto_l3_route *r;
+	u64 dev_mac;
+
+	if (ipv4_is_multicast(ip_addr) || ipv4_is_lbcast(ip_addr) || ipv4_is_zeronet(ip_addr))
+		return 0;
+
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->is_host_route && r->dst_ip == ip_addr)
+			return 0;
+
+	r = otto_l3_host_route_alloc(ctrl, ip_addr);
+	if (!r)
+		return -ENOSPC;
+
+	dev_mac = ether_addr_to_u64(dev->dev_addr);
+	r->dst_ip = ip_addr;
+	r->prefix_len = 32;
+	r->tb_id = RT_TABLE_MAIN;
+	r->is_auto_host = true;
+	r->ifindex = dev->ifindex;
+	r->attr.type = ROUTE_TYPE_IP4UC;
+	r->nh.rvid = vlan_dev_vlan_id(dev);
+	r->nh.port = priv->r->port_ignore;
+	r->nh.id = r->id;
+	r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, dev_mac, r->nh.rvid);
+	if (r->nh.if_id < 0) {
+		otto_l3_route_teardown(ctrl, r);
+		return -ENOSPC;
+	}
+
+	dev_dbg(ctrl->dev, "host %pI4 on %s\n", &ip_addr, dev->name);
+
+	return 0;
+}
+
+static void otto_l3_auto_host_route_del(struct otto_l3_ctrl *ctrl, struct net_device *dev,
+					__be32 ip_addr)
+{
+	struct otto_l3_route *r;
+
+	r = otto_l3_find_auto_host_route(ctrl, ip_addr);
+	if (!r || r->ifindex != dev->ifindex)
+		return;
+
+	dev_dbg(ctrl->dev, "host %pI4 removed\n", &ip_addr);
+	otto_l3_route_teardown(ctrl, r);
+}
+
 static void otto_l3_net_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_net_event_work *net_work =
 		container_of(work, struct otto_l3_net_event_work, work);
 	struct otto_l3_ctrl *ctrl = net_work->ctrl;
+	struct net_device *dev = net_work->dev;
 
-	if (net_work->valid)
+	if (net_work->valid) {
+		if (otto_l3_dev_routed(ctrl, dev))
+			otto_l3_auto_host_route_add(ctrl, dev, net_work->ip_addr);
 		otto_l3_nexthop_update(ctrl, net_work->ip_addr, net_work->mac);
-	else
+	} else {
 		otto_l3_nexthop_trap(ctrl, net_work->ip_addr);
+		otto_l3_auto_host_route_del(ctrl, dev, net_work->ip_addr);
+	}
 
+	dev_put(dev);
 	kfree(net_work);
 }
 
@@ -1727,6 +1802,8 @@ static void otto_l3_neigh_queue(struct otto_l3_ctrl *ctrl, struct neighbour *n)
 
 	INIT_WORK(&net_work->work, otto_l3_net_event_work_do);
 	net_work->ctrl = ctrl;
+	net_work->dev = n->dev;
+	dev_hold(n->dev);
 	/* A flushed or collected entry is marked dead but may keep a valid
 	 * state. Once it is gone, packets for the host trap to the CPU again,
 	 * which resolves it anew.
@@ -2255,6 +2332,14 @@ static const struct file_operations otto_l3_930x_clear_hit_fops = {
 	.write = otto_l3_930x_clear_hit_write,
 };
 
+static void otto_l3_sync_neigh_cb(struct neighbour *n, void *cookie)
+{
+	struct otto_l3_ctrl *ctrl = cookie;
+
+	if (otto_l3_port_dev_lower_find(n->dev, ctrl) >= 0)
+		otto_l3_neigh_queue(ctrl, n);
+}
+
 /* Turns routing in the switch on or off. Runs on priv->wq like the FIB and
  * neighbour work, which is what serializes it against them.
  */
@@ -2277,9 +2362,9 @@ static void otto_l3_enable_work_do(struct work_struct *work)
 		return;
 	}
 
-	/* Take in the routes already there. Registering the FIB notifier
-	 * again replays the FIB; while routing was off its events were
-	 * ignored, so none are lost. It only queues work behind this one.
+	/* Take in the routes and neighbours already there. Registering the
+	 * FIB notifier again replays the FIB; while routing was off its events
+	 * were ignored, so none are lost. Both only queue work behind this one.
 	 */
 	dev_info(ctrl->dev, "L3 routing on\n");
 	unregister_fib_notifier(&init_net, &ctrl->fib_nb);
@@ -2289,6 +2374,8 @@ static void otto_l3_enable_work_do(struct work_struct *work)
 		ctrl->fib_nb.notifier_call = NULL;
 		dev_err(ctrl->dev, "FIB replay failed, routes are not offloaded: %d\n", err);
 	}
+
+	neigh_for_each(&arp_tbl, otto_l3_sync_neigh_cb, ctrl);
 }
 
 /* 1 when the switch routes: every IPv4 route via a VLAN device on the switch
