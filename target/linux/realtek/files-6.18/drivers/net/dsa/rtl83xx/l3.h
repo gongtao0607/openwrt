@@ -3,7 +3,11 @@
 #ifndef _OTTO_L3_H
 #define _OTTO_L3_H
 
+#include <net/dscp.h>
+
 #include "rtl-otto.h"
+
+struct fib_info;
 
 #define MAX_HOST_ROUTES		1536
 #define MAX_ROUTES		512
@@ -76,6 +80,11 @@ struct otto_l3_route {
 	struct in6_addr dst_ip6;
 	int prefix_len;			/* Network prefix len of the destination net */
 	bool is_host_route;
+	int ifindex;			/* L3 device the route leaves through */
+	/* The FIB entry the route mirrors */
+	struct fib_info *fi;
+	dscp_t dscp;
+	u8 fib_type;
 	int id;				/* ID number of this route */
 	int row;			/* Row it occupies in the prefix route table */
 	struct rhlist_head linkage;

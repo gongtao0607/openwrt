@@ -1103,7 +1103,7 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 				continue;
 			}
 
-			dev_info(ctrl->dev, "Got slot for route: %d\n", slot);
+			dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
 			ctrl->cfg->host_route_write(ctrl, slot, r);
 		} else {
 			if (r->row < 0)
@@ -1203,10 +1203,10 @@ static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl,
 	 */
 	if (n->nud_state & NUD_VALID) {
 		mac = ether_addr_to_u64(n->ha);
-		dev_info(ctrl->dev, "resolved mac: %016llx\n", mac);
+		dev_dbg(ctrl->dev, "resolved mac: %016llx\n", mac);
 		otto_l3_nexthop_update(ctrl, ip_addr, mac);
 	} else {
-		dev_info(ctrl->dev, "need to wait\n");
+		dev_dbg(ctrl->dev, "need to wait\n");
 		neigh_event_send(n, NULL);
 	}
 
@@ -1347,6 +1347,11 @@ static void otto_l3_route_teardown(struct otto_l3_ctrl *ctrl, struct otto_l3_rou
 	if (r->pr.id >= 0)
 		priv->r->pie_rule_rm(priv, &r->pr);
 
+	if (r->fi) {
+		fib_info_put(r->fi);
+		r->fi = NULL;
+	}
+
 	dev_dbg(ctrl->dev, "releasing packet counter %d\n", r->pr.packet_cntr);
 	rtldsa_packet_cntr_free(priv, r->pr.packet_cntr);
 
@@ -1455,26 +1460,22 @@ out_free:
 	return NULL;
 }
 
-static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
-				struct fib_entry_notifier_info *info,
-				enum fib_event_type event)
+/* Whether the switch can do what the kernel does with this route */
+static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
 {
-	struct net_device *ndev = fib_info_nh(info->fi, 0)->fib_nh_dev;
-	int vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
-	struct fib_nh *nh = fib_info_nh(info->fi, 0);
-	char gw_message[32] = "";
+	if (info->type == RTN_LOCAL)
+		return ipv4_is_loopback(info->dst) ? -EINVAL : 0;
 
-	if (nh->fib_nh_gw4)
-		snprintf(gw_message, sizeof(gw_message), "via %pI4 ", &nh->fib_nh_gw4);
-
-	dev_info(ctrl->dev, "%s IPv4 route %pI4/%d %s(VLAN %d, MAC %pM)\n",
-		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
-		 &info->dst, info->dst_len, gw_message, vlan, ndev->dev_addr);
-
-	if ((info->type == RTN_BROADCAST) || ipv4_is_loopback(info->dst) || !info->dst) {
-		dev_warn(ctrl->dev, "skip loopback/broadcast addresses and default routes\n");
+	/* Broadcast, multicast, blackhole and the like stay with the CPU */
+	if (info->type != RTN_UNICAST)
 		return -EINVAL;
-	}
+
+	/* Other tables are policy routing, which the switch cannot do */
+	if (info->tb_id != RT_TABLE_MAIN)
+		return -EOPNOTSUPP;
+
+	if (fib_info_num_path(info->fi) > 1)
+		return -EOPNOTSUPP;
 
 	return 0;
 }
@@ -1488,29 +1489,37 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	__be32 gw = nh->fib_nh_gw4;
 	struct otto_l3_route *route;
 	u64 mac;
+	int err;
 
 	if (!ctrl->enabled || !ndev || otto_l3_port_dev_lower_find(ndev, ctrl) < 0)
 		return 0;
 
-	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_ADD))
-		return 0;
-
-	if (!otto_l3_dev_routed(ctrl, ndev)) {
-		dev_warn(ctrl->dev, "route %pI4/%d on %s is not offloaded\n",
-			 &info->dst, info->dst_len, ndev->name);
-		return 0;
-	}
-
-	/* Every add that reaches the driver arrives as a replace, so a route
-	 * for this destination may already be programmed. Take it out first.
+	/* Every add that reaches the driver arrives as a replace, and a
+	 * replay of the FIB repeats the ones already here. The entry that is
+	 * already mirrored stays as it is, anything else replaces it.
 	 */
 	route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst, NULL,
 				   info->dst_len);
+	if (route && route->fi == info->fi) {
+		if (gw)
+			otto_l3_port_ipv4_resolve(ctrl, ndev, gw);
+		return 0;
+	}
 	if (route) {
 		dev_dbg(ctrl->dev, "replacing route %pI4/%d, id %d\n",
 			&info->dst, info->dst_len, route->id);
 		otto_l3_route_teardown(ctrl, route);
+		if (local)
+			otto_l3_router_macs_update(ctrl);
 	}
+
+	err = otto_l3_fib_check_v4(ctrl, info);
+	if (!err && !otto_l3_dev_routed(ctrl, ndev))
+		err = -EOPNOTSUPP;
+	if (err == -EOPNOTSUPP)
+		goto out_failed;
+	if (err)
+		return 0;
 
 	/* The switch's own addresses and routes via a gateway go to the host
 	 * table when they are single addresses. Directly connected subnets,
@@ -1521,14 +1530,17 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 		route = otto_l3_host_route_alloc(ctrl, gw);
 	else
 		route = otto_l3_route_alloc(ctrl, gw);
-	if (!route) {
-		dev_err(ctrl->dev, "no room for route %pI4/%d\n", &info->dst, info->dst_len);
-		return -ENOSPC;
-	}
+	if (!route)
+		goto out_failed;
 
 	route->dst_ip = info->dst;
 	route->prefix_len = info->dst_len;
 	route->tb_id = info->tb_id;
+	route->ifindex = ndev->ifindex;
+	route->fi = info->fi;
+	fib_info_hold(route->fi);
+	route->dscp = info->dscp;
+	route->fib_type = info->type;
 
 	mac = ether_addr_to_u64(ndev->dev_addr);
 	route->nh.rvid = vlan_dev_vlan_id(ndev);
@@ -1552,6 +1564,10 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (local)
 		otto_l3_router_macs_update(ctrl);
 
+	dev_info(ctrl->dev, "%s %pI4/%d via %pI4 on %s\n",
+		 local ? "local" : gw ? "route" : "connected", &info->dst, info->dst_len,
+		 &gw, ndev->name);
+
 	/* Forward in the switch once the gateway is resolved */
 	if (gw)
 		otto_l3_port_ipv4_resolve(ctrl, ndev, gw);
@@ -1562,47 +1578,27 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 out_teardown:
 	otto_l3_route_teardown(ctrl, route);
+out_failed:
+	dev_warn(ctrl->dev, "route %pI4/%d on %s is not offloaded\n",
+		 &info->dst, info->dst_len, ndev->name);
 	return 0;
 }
 
 static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifier_info *info)
 {
 	struct fib_nh *nh = fib_info_nh(info->fi, 0);
-	struct rhlist_head *tmp, *list;
 	struct otto_l3_route *route;
-	bool found = false;
+	bool local;
 
-	if (!ctrl->enabled)
+	route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst, NULL,
+				   info->dst_len);
+	if (!route || route->fi != info->fi)
 		return 0;
 
-	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_DEL))
-		return 0;
-
-	rcu_read_lock();
-	list = rhltable_lookup(&ctrl->routes, &nh->fib_nh_gw4, otto_l3_route_ht_params);
-	if (!list) {
-		rcu_read_unlock();
-		dev_err(ctrl->dev, "no such gateway: %pI4\n", &nh->fib_nh_gw4);
-		return -ENOENT;
-	}
-	rhl_for_each_entry_rcu(route, tmp, list, linkage) {
-		if (route->dst_ip == info->dst && route->prefix_len == info->dst_len) {
-			dev_info(ctrl->dev, "found a route with id %d, nh-id %d\n",
-				 route->id, route->nh.id);
-			found = true;
-			break;
-		}
-	}
-	rcu_read_unlock();
-
-	if (!found) {
-		dev_err(ctrl->dev, "no route %pI4/%d via %pI4\n",
-			&info->dst, info->dst_len, &nh->fib_nh_gw4);
-		return -ENOENT;
-	}
-
+	dev_info(ctrl->dev, "removing %pI4/%d (id %d)\n", &info->dst, info->dst_len, route->id);
+	local = route->tb_id == RT_TABLE_LOCAL;
 	otto_l3_route_teardown(ctrl, route);
-	if (info->tb_id == RT_TABLE_LOCAL)
+	if (local)
 		otto_l3_router_macs_update(ctrl);
 
 	nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
