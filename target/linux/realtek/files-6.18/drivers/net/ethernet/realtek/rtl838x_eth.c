@@ -448,9 +448,23 @@ static void rteth_setup_cpu_rx_rings(struct rteth_ctrl *ctrl)
 			int shift = (reason % fields_per_reg) * bits_per_field;
 			int ring = reason % RTETH_RX_RINGS;
 
+			/* The last ring is kept for the L3 trap, see below */
+			if (ctrl->cfg->l3_trap_reason)
+				ring = reason == ctrl->cfg->l3_trap_reason ? RTETH_RX_RINGS - 1 : 0;
+
 			regmap_update_bits(ctrl->map, reg, mask << shift, ring << shift);
 		}
 	}
+
+	/*
+	 * When the switch routes, it traps to the CPU the packets for hosts it
+	 * has not resolved yet and those whose TTL runs out. Anybody can send
+	 * those at line rate, which would take the CPU. They get a ring of
+	 * their own with a rate limit, so ARP and management traffic is not
+	 * held up behind them.
+	 */
+	if (ctrl->cfg->l3_trap_reason && ctrl->cfg->set_cpu_q_rate)
+		ctrl->cfg->set_cpu_q_rate(ctrl, RTETH_RX_RINGS - 1, 4000);
 }
 
 static void rteth_hw_ring_setup(struct rteth_ctrl *ctrl)
@@ -1658,6 +1672,12 @@ static const struct net_device_ops rteth_930x_netdev_ops = {
 	.ndo_setup_tc		= rteth_setup_tc,
 };
 
+static void rteth_930x_set_cpu_q_rate(struct rteth_ctrl *ctrl, int q, u32 kbps)
+{
+	regmap_write(ctrl->map, RTETH_930X_CPU_Q_BW_CTRL(q),
+		     RTETH_930X_CPU_Q_BW_CTRL_EN | (kbps / 16));
+}
+
 static const struct rteth_cfg rteth_930x_cfg = {
 	.cpu_port		= RTETH_930X_CPU_PORT,
 	.max_mtu		= RTETH_930X_MAX_FRAME - RTETH_FRAME_OVERHEAD,
@@ -1667,6 +1687,8 @@ static const struct rteth_cfg rteth_930x_cfg = {
 	.mac_l2_port_ctrl	= RTETH_930X_MAC_L2_PORT_CTRL,
 	.qm_rsn2cpuqid_ctrl	= RTETH_930X_QM_RSN2CPUQID_CTRL_0,
 	.qm_rsn2cpuqid_cnt	= RTETH_930X_QM_RSN2CPUQID_CTRL_CNT,
+	.l3_trap_reason		= RTETH_930X_RSN_L3_ROUTE_TRAP,
+	.set_cpu_q_rate		= rteth_930x_set_cpu_q_rate,
 	.dma_if_ctrl		= RTETH_930X_DMA_IF_CTRL,
 	.dma_if_intr_sts	= RTETH_930X_DMA_IF_INTR_STS,
 	.dma_if_intr_msk	= RTETH_930X_DMA_IF_INTR_MSK,

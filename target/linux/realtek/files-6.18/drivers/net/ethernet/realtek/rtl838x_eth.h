@@ -63,6 +63,13 @@
 #define RTETH_930X_MAC_L2_PORT_MAX_LEN_CTRL	(0x326c + RTETH_930X_CPU_PORT * 64)
 #define RTETH_930X_QM_RSN2CPUQID_CTRL_0		(0xa344)
 #define RTETH_930X_QM_RSN2CPUQID_CTRL_CNT	11
+/* Rate limit of each of the 32 CPU queues, found by testing: bits 19:0 are
+ * the rate in 16 kbit/s, bit 20 turns it on, the next word is the burst.
+ */
+#define RTETH_930X_CPU_Q_BW_CTRL(q)		(0x7cb8 + (q) * 8)
+#define RTETH_930X_CPU_Q_BW_CTRL_EN		BIT(20)
+/* CPU tag reason of packets the L3 routing tables trap, found by testing */
+#define RTETH_930X_RSN_L3_ROUTE_TRAP		34
 #define RTETH_930X_RMA_CTRL_0			(0x9e60)
 #define RTETH_930X_RMA_CTRL_1			(0x9e64)
 #define RTETH_930X_RMA_CTRL_2			(0x9e68)
@@ -324,6 +331,7 @@ struct rteth_cfg {
 	int qm_pkt2cpu_intpri_map;
 	int qm_rsn2cpuqid_ctrl;
 	int qm_rsn2cpuqid_cnt;
+	int l3_trap_reason;	/* 0 when the family does not route */
 	int dma_if_intr_sts;
 	int dma_if_intr_msk;
 	int dma_if_rx_ring_cntr;
@@ -345,6 +353,8 @@ struct rteth_cfg {
 	void (*hw_en_rxtx)(struct rteth_ctrl *ctrl);
 	void (*hw_init)(struct rteth_ctrl *ctrl);
 	void (*hw_stop)(struct rteth_ctrl *ctrl);
+	/* Rate limit a CPU queue, in kbit/s */
+	void (*set_cpu_q_rate)(struct rteth_ctrl *ctrl, int q, u32 kbps);
 	void (*hw_reset)(struct rteth_ctrl *ctrl);
 	int (*init_mac)(struct rteth_ctrl *ctrl);
 	void (*set_hol)(struct rteth_ctrl *ctrl);
