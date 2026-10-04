@@ -1,0 +1,36 @@
+From: Tao Gong <gongtao0607@gmail.com>
+Subject: [PATCH] netfilter: flowtable: skip the bridge VLAN push for VLAN device ports
+
+When a bridge port is a VLAN device (e.g. lan2.21), the path walk sets it
+as the transmit device and also records its VLAN as encap. The bridge fast
+path then pushes that VLAN and transmits through the VLAN device, which
+adds the same tag again. The frame leaves double tagged and is lost. TCP
+connections establish and then stall, as the handshake still takes the
+slow path.
+
+Do not push the tag when the transmit device differs from the hardware
+device, i.e. when a VLAN device adds it.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -376,6 +376,7 @@ static void nf_flow_bridge_vlan_push(str
+ 				     struct sk_buff *skb)
+ {
+ 	const struct flow_offload_tuple *other = &flow->tuplehash[!dir].tuple;
++	const struct flow_offload_tuple *this = &flow->tuplehash[dir].tuple;
+ 
+ 	if (flow_table->type->family != NFPROTO_BRIDGE || !other->encap_num)
+ 		return;
+@@ -384,6 +385,10 @@ static void nf_flow_bridge_vlan_push(str
+ 	if (other->in_vlan_ingress & BIT(0))
+ 		return;
+ 
++	/* Egress port is a VLAN device, which adds its tag itself */
++	if (this->out.ifidx != this->out.hw_ifidx)
++		return;
++
+ 	if (other->encap[0].proto == htons(ETH_P_8021Q) ||
+ 	    other->encap[0].proto == htons(ETH_P_8021AD))
+ 		__vlan_hwaccel_put_tag(skb, other->encap[0].proto,
