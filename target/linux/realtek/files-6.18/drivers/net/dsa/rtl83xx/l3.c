@@ -59,7 +59,8 @@
  *   A default route takes the row above the catch-all of its family.
  *   Multicast routing is not offloaded, and all egress interfaces share one
  *   1536 byte MTU. The programmed state is shown in debugfs, under
- *   realtek_otto_l3.
+ *   realtek_otto_l3. Writing 0 to the l3_offload attribute of the switch
+ *   device takes everything out of the switch, and the kernel routes.
  * - RTL839x: IPv4 unicast routes through a gateway are forwarded through PIE
  *   rules, each with a packet counter while one is free. No IPv6, and no
  *   trapping entries.
@@ -924,7 +925,8 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 		int port = -1;
 		u16 vid = 0;
 
-		if (!(dev->flags & IFF_UP) || !otto_l3_dev_has_addr(dev))
+		if (!READ_ONCE(ctrl->enabled) || !(dev->flags & IFF_UP) ||
+		    !otto_l3_dev_has_addr(dev))
 			continue;
 
 		if (is_vlan_dev(dev) || (netif_is_bridge_master(dev) && !br_vlan_enabled(dev))) {
@@ -3157,7 +3159,7 @@ static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 	bool added = false;
 	int vlan;
 
-	if (!ctrl->cfg->use_l3_tables)
+	if (!ctrl->cfg->use_l3_tables || !READ_ONCE(ctrl->enabled))
 		return false;
 
 	if (type == ROUTE_TYPE_IP4UC) {
@@ -4142,10 +4144,49 @@ static const struct of_device_id otto_l3_of_ids[] = {
 	{ /* sentinel */ }
 };
 
+/* 1 while the switch routes. Writing 0 takes every route and neighbour out of
+ * the switch and its router MACs with them, so that the kernel routes; writing
+ * 1 replays the FIB into it. Both run as a resync does, and the write returns
+ * once it is done.
+ */
+static ssize_t l3_offload_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl838x_switch_priv *priv = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(priv->l3_ctrl->enabled));
+}
+
+static ssize_t l3_offload_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct rtl838x_switch_priv *priv = dev_get_drvdata(dev);
+	struct otto_l3_ctrl *ctrl = priv->l3_ctrl;
+	bool enable;
+	int err;
+
+	err = kstrtobool(buf, &enable);
+	if (err)
+		return err;
+
+	if (enable != READ_ONCE(ctrl->enabled)) {
+		WRITE_ONCE(ctrl->enabled, enable);
+		dev_info(ctrl->dev, "L3 routing %s\n", enable ? "on" : "off");
+		mod_delayed_work(system_long_wq, &ctrl->resync_work, 0);
+	}
+	flush_delayed_work(&ctrl->resync_work);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(l3_offload);
+
 void otto_l3_remove(struct rtl838x_switch_priv *priv)
 {
 	struct otto_l3_ctrl *ctrl = priv->l3_ctrl;
 	struct otto_l3_route *r, *tmp;
+
+	if (ctrl->cfg->use_l3_tables)
+		device_remove_file(ctrl->dev, &dev_attr_l3_offload);
 
 	/* A replay would register the FIB notifier again */
 	disable_delayed_work_sync(&ctrl->resync_work);
@@ -4231,13 +4272,25 @@ static void otto_l3_resync_work_do(struct work_struct *work)
 {
 	struct otto_l3_ctrl *ctrl = container_of(to_delayed_work(work), struct otto_l3_ctrl,
 						 resync_work);
+	bool wanted = READ_ONCE(ctrl->resync_wanted);
 	int err;
 
 	WRITE_ONCE(ctrl->resync_wanted, false);
-	if (!ctrl->resync_delay)
+	if (wanted && !ctrl->resync_delay)
 		dev_warn(ctrl->dev, "an L3 event could not be queued, replaying the FIB\n");
 	unregister_fib_notifier(&init_net, &ctrl->fib_nb);
 	otto_l3_fib_dump_flush(&ctrl->fib_nb);
+
+	/* Routing turned off: nothing is put back, and no frame hits a router
+	 * MAC any more. Turned on, the router MACs come back with it.
+	 */
+	rtnl_lock();
+	otto_l3_router_macs_update(ctrl);
+	rtnl_unlock();
+	if (!READ_ONCE(ctrl->enabled)) {
+		ctrl->resync_delay = 0;
+		return;
+	}
 
 	err = register_fib_notifier(&init_net, &ctrl->fib_nb, otto_l3_fib_dump_flush, NULL);
 	if (!err) {
@@ -4275,6 +4328,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	INIT_DELAYED_WORK(&ctrl->resync_work, otto_l3_resync_work_do);
 	disable_delayed_work(&ctrl->resync_work);
 	INIT_WORK(&ctrl->router_mac_work, otto_l3_router_mac_work_do);
+	ctrl->enabled = true;
 	INIT_WORK(&ctrl->neigh_sync_work, otto_l3_neigh_sync_work_do);
 	INIT_DELAYED_WORK(&ctrl->negative_work, otto_l3_negative_work_do);
 
@@ -4352,6 +4406,12 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 
 	if (ctrl->cfg->dbgfs_init)
 		ctrl->cfg->dbgfs_init(ctrl);
+
+	if (ctrl->cfg->use_l3_tables) {
+		err = device_create_file(ctrl->dev, &dev_attr_l3_offload);
+		if (err)
+			dev_warn(dev, "no l3_offload attribute: %d\n", err);
+	}
 
 	return 0;
 }

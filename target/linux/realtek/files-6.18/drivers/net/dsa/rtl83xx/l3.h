@@ -157,6 +157,7 @@ struct otto_l3_ctrl {
 	bool prefix_rows_stale;	/* a move failed, the rows are not where we say */
 	bool v4_fwd_off;	/* policy rules keep IPv4 forwarding in software */
 	bool v6_fwd_off;	/* policy rules keep IPv6 forwarding in software */
+	bool enabled;		/* the switch routes, see the l3_offload attribute */
 	struct mutex *lock; /* protect register access */
 };
 
