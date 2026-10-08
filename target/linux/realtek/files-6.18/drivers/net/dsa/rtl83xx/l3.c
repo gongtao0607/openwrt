@@ -49,10 +49,10 @@
  *   device outside the switch, a nexthop object or a lightweight tunnel,
  *   multipath routes, IPv4 routes for one DSCP value and, for IPv6,
  *   source-specific and RA-learnt routes.
- *   Default routes have no entry, so their packets reach the CPU through the
- *   catch-all rows. Multicast routing is not offloaded, and all egress
- *   interfaces share one 1536 byte MTU. The programmed state is shown in
- *   debugfs, under realtek_otto_l3.
+ *   A default route takes the row above the catch-all of its family.
+ *   Multicast routing is not offloaded, and all egress interfaces share one
+ *   1536 byte MTU. The programmed state is shown in debugfs, under
+ *   realtek_otto_l3.
  * - RTL839x: IPv4 unicast routes through a gateway are forwarded through PIE
  *   rules, each with a packet counter while one is free. No IPv6, and no
  *   trapping entries.
@@ -1060,7 +1060,9 @@ static int otto_l3_v6_slot(int row)
 /* The programmed prefix routes of one address family sit in one dense block,
  * longest prefix first, because the hardware answers a lookup with the lowest
  * matching row rather than the most specific one. A lookup carries the entry
- * type, so a block is only ever matched against its own family.
+ * type, so a block is only ever matched against its own family. The catch-all
+ * row, which belongs to no table, counts as shorter than the default route, so
+ * that it stays the last row of the block. An at_least of -1 counts them all.
  */
 static int otto_l3_prefix_rows(struct otto_l3_ctrl *ctrl, u8 type, int at_least)
 {
@@ -1068,8 +1070,8 @@ static int otto_l3_prefix_rows(struct otto_l3_ctrl *ctrl, u8 type, int at_least)
 	int n = 0;
 
 	list_for_each_entry(q, &ctrl->routes_list, list) {
-		if (!q->is_host_route && q->row >= 0 &&
-		    q->attr.type == type && q->prefix_len >= at_least)
+		if (!q->is_host_route && q->row >= 0 && q->attr.type == type &&
+		    (q->tb_id ? q->prefix_len : -1) >= at_least)
 			n++;
 	}
 
@@ -1114,12 +1116,12 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	 * main's of the same length: the hardware answers with the first row
 	 * that matches.
 	 */
-	below = otto_l3_prefix_rows(ctrl, r->attr.type,
-				    r->prefix_len + (r->tb_id == RT_TABLE_LOCAL));
-	rows = otto_l3_prefix_rows(ctrl, r->attr.type, 0);
+	below = otto_l3_prefix_rows(ctrl, r->attr.type, r->tb_id ?
+				    r->prefix_len + (r->tb_id == RT_TABLE_LOCAL) : -1);
+	rows = otto_l3_prefix_rows(ctrl, r->attr.type, -1);
 
 	if (r->attr.type == ROUTE_TYPE_IP6UC) {
-		int v4_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP4UC, 0);
+		int v4_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP4UC, -1);
 
 		if (otto_l3_v6_row(rows) < FIRST_PREFIX_ROW + v4_rows) {
 			dev_err(ctrl->dev, "prefix route table full, %d IPv4 and %d IPv6 routes\n",
@@ -1152,7 +1154,7 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		return row;
 	}
 
-	v6_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP6UC, 0);
+	v6_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP6UC, -1);
 	row = FIRST_PREFIX_ROW + below;
 	last = FIRST_PREFIX_ROW + rows;
 
@@ -1193,7 +1195,7 @@ static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	    ctrl->prefix_rows_stale)
 		return;
 
-	rows = otto_l3_prefix_rows(ctrl, r->attr.type, 0);
+	rows = otto_l3_prefix_rows(ctrl, r->attr.type, -1);
 
 	/* The leaving row is already invalid, so even a move that wrote nothing
 	 * leaves a hole in the block that the row count cannot see.
@@ -1895,8 +1897,8 @@ static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
 		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
 		 &info->dst, info->dst_len, gw_message, vlan, ndev->dev_addr);
 
-	if ((info->type == RTN_BROADCAST) || ipv4_is_loopback(info->dst) || !info->dst) {
-		dev_warn(ctrl->dev, "skip loopback/broadcast addresses and default routes\n");
+	if ((info->type == RTN_BROADCAST) || ipv4_is_loopback(info->dst)) {
+		dev_warn(ctrl->dev, "skip loopback/broadcast addresses\n");
 		return -EINVAL;
 	}
 
@@ -2212,14 +2214,7 @@ static int otto_l3_fib_check_v6(struct otto_l3_ctrl *ctrl, struct fib6_info *rt,
 	if (rt->fib6_flags & RTF_ADDRCONF)
 		return -EOPNOTSUPP;
 
-	/* A row for the default route matches every destination no more
-	 * specific row holds, and the destinations this driver leaves out are
-	 * exactly the ones it does not know what to do with - a prefix that is
-	 * on-link somewhere else among them. Sending those to the gateway is
-	 * worse than trapping them, which is what the catch-all row does with
-	 * them.
-	 */
-	if (ipv6_addr_any(&rt->fib6_dst.addr) || ipv6_addr_loopback(&rt->fib6_dst.addr))
+	if (ipv6_addr_loopback(&rt->fib6_dst.addr))
 		return -EOPNOTSUPP;
 
 	if (rt->fib6_nh->fib_nh_gw_family != AF_INET6)
