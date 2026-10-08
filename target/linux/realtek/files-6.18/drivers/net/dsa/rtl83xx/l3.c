@@ -39,7 +39,8 @@
  * lookup for a forwarded packet is not local, then main, turn the forwarding
  * entries of that family into traps until those rules are gone. An event the
  * driver could not take, for want of memory, has the routes flushed and the
- * FIB replayed.
+ * FIB replayed. A neighbour that fails to resolve is dropped in the switch for
+ * 30 seconds.
  *
  * State per family:
  * - RTL930x: IPv4 and IPv6 unicast routes through a gateway are forwarded,
@@ -125,6 +126,7 @@ struct otto_l3_net_event_work {
 	struct in6_addr gw_addr;
 	int ifindex;
 	bool valid;
+	bool failed;	/* resolving the neighbour failed */
 	bool sync;	/* from otto_l3_neigh_sync_work_do(), not an event */
 	u8 type;
 };
@@ -1613,7 +1615,7 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 		/* An IPv4 gateway written v4-mapped is a valid IPv6 one, so
 		 * the address alone does not say whose route this is.
 		 */
-		if (r->attr.type != type || r->gw_ifindex != ifindex)
+		if (r->attr.type != type || r->gw_ifindex != ifindex || r->negative)
 			continue;
 
 		if (valid)
@@ -2841,7 +2843,7 @@ static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 		/* Back to forwarding the way a neighbour update brings a route
 		 * back: through the gateway, if it still answers
 		 */
-		if (ipv6_addr_any(&r->gw_ip) ||
+		if (ipv6_addr_any(&r->gw_ip) || r->negative ||
 		    (type == ROUTE_TYPE_IP4UC && !r->gw_ip.s6_addr32[3]) ||
 		    otto_l3_gw_seen(ctrl, r))
 			continue;
@@ -2911,16 +2913,40 @@ static void otto_l3_neigh_evict(struct otto_l3_ctrl *ctrl, u8 type, const struct
 		otto_l3_route_teardown(ctrl, r);
 }
 
+/* How long, and for how many hosts at most, a host that does not answer is
+ * dropped in the switch. An IPv6 entry takes three prefix rows.
+ */
+#define OTTO_L3_NEGATIVE_TIME	(30 * HZ)
+#define OTTO_L3_NEGATIVE_MAX_V4	64
+#define OTTO_L3_NEGATIVE_MAX_V6	8
+
+static int otto_l3_negative_count(struct otto_l3_ctrl *ctrl, u8 type)
+{
+	struct otto_l3_route *r;
+	int n = 0;
+
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->negative && r->attr.type == type)
+			n++;
+
+	return n;
+}
+
 /* A neighbour the kernel reaches on-link through a VLAN of the switch gets an
  * entry of its own, with itself as the gateway: otto_l3_nexthop_update()
  * forwards it like any route through a gateway, and the neighbour going away
  * takes it out again, so that the trap of the on-link prefix hands the host's
  * packets back to the CPU. IPv4 neighbours go to the host table, IPv6 ones to
  * the prefix table, where the driver keeps every IPv6 destination. Nothing is
- * ever routed to a link-local neighbour. Returns whether an entry was added.
+ * ever routed to a link-local neighbour.
+ *
+ * A neighbour that failed to resolve gets a negative entry instead, which
+ * drops its packets in the switch for a while. Otherwise a stream to an
+ * address nobody has is trapped to the CPU at line rate, and resolved again
+ * and again. Returns whether an entry was added.
  */
 static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
-			      const struct in6_addr *addr)
+			      const struct in6_addr *addr, bool negative)
 {
 	int plen = type == ROUTE_TYPE_IP4UC ? 32 : 128;
 	__be32 ip = addr->s6_addr32[3];
@@ -2944,10 +2970,14 @@ static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 	}
 
 	r = otto_l3_neigh_find(ctrl, type, addr);
-	if (r && r->gw_ifindex == ifindex)
+	if (r && r->gw_ifindex == ifindex && r->negative == negative)
 		return false;
 	if (r)
 		otto_l3_route_teardown(ctrl, r);
+
+	if (negative && otto_l3_negative_count(ctrl, type) >=
+	    (type == ROUTE_TYPE_IP4UC ? OTTO_L3_NEGATIVE_MAX_V4 : OTTO_L3_NEGATIVE_MAX_V6))
+		return false;
 
 	/* A route of its own from the FIB keeps the entry */
 	list_for_each_entry(r, &ctrl->routes_list, list)
@@ -2979,17 +3009,25 @@ static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 	r->prefix_len = plen;
 	r->gw_ifindex = ifindex;
 	r->nh.rvid = vlan;
-	r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, ether_addr_to_u64(dev->dev_addr), vlan);
-
-	/* Trapping until otto_l3_nexthop_update() has a port to forward to */
 	r->attr.valid = true;
-	r->attr.action = ROUTE_ACT_TRAP2CPU;
-	if (r->nh.if_id < 0 || otto_l3_route_install(ctrl, r)) {
+	if (negative) {
+		r->negative = true;
+		r->expires = jiffies + OTTO_L3_NEGATIVE_TIME;
+		r->attr.action = ROUTE_ACT_DROP;
+	} else {
+		r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, ether_addr_to_u64(dev->dev_addr),
+							vlan);
+		/* Trapping until otto_l3_nexthop_update() has a port to forward to */
+		r->attr.action = ROUTE_ACT_TRAP2CPU;
+	}
+	if ((!negative && r->nh.if_id < 0) || otto_l3_route_install(ctrl, r)) {
 		otto_l3_route_put_intf(ctrl, r);
 		otto_l3_route_free(ctrl, r);
 		goto out;
 	}
 	added = true;
+	if (negative)
+		queue_delayed_work(ctrl->priv->wq, &ctrl->negative_work, OTTO_L3_NEGATIVE_TIME);
 
 out:
 	dev_put(dev);
@@ -3003,6 +3041,27 @@ static void otto_l3_neigh_del(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 
 	if (r && r->gw_ifindex == ifindex)
 		otto_l3_route_teardown(ctrl, r);
+}
+
+static void otto_l3_negative_work_do(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(to_delayed_work(work), struct otto_l3_ctrl,
+						 negative_work);
+	struct otto_l3_route *r, *tmp;
+	unsigned long next = 0;
+
+	list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list) {
+		if (!r->negative)
+			continue;
+		if (time_after_eq(jiffies, r->expires))
+			otto_l3_route_teardown(ctrl, r);
+		else if (!next || time_before(r->expires, next))
+			next = r->expires;
+	}
+
+	if (next)
+		queue_delayed_work(ctrl->priv->wq, &ctrl->negative_work,
+				   time_after(next, jiffies) ? next - jiffies : 0);
 }
 
 static void otto_l3_fib_event_work_do(struct work_struct *work)
@@ -3214,7 +3273,7 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 
 	if (net_work->valid)
 		added = otto_l3_neigh_add(ctrl, net_work->type, net_work->ifindex,
-					  &net_work->gw_addr);
+					  &net_work->gw_addr, false);
 	else
 		otto_l3_neigh_del(ctrl, net_work->type, net_work->ifindex, &net_work->gw_addr);
 
@@ -3224,6 +3283,10 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 	if (!net_work->sync || added)
 		otto_l3_nexthop_update(ctrl, net_work->type, net_work->ifindex,
 				       &net_work->gw_addr, net_work->mac, net_work->valid);
+
+	if (net_work->failed)
+		otto_l3_neigh_add(ctrl, net_work->type, net_work->ifindex,
+				  &net_work->gw_addr, true);
 
 	kfree(net_work);
 }
@@ -3256,6 +3319,7 @@ static int otto_l3_neigh_queue(struct otto_l3_ctrl *ctrl, struct neighbour *n, b
 	 */
 	read_lock_bh(&n->lock);
 	net_work->valid = (n->nud_state & NUD_VALID) && !n->dead;
+	net_work->failed = (n->nud_state & NUD_FAILED) && !n->dead;
 	net_work->mac = ether_addr_to_u64(n->ha);
 	read_unlock_bh(&n->lock);
 	net_work->ifindex = n->dev->ifindex;
@@ -3892,6 +3956,7 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 		ctrl->fib_nb.notifier_call = NULL;
 	}
 	disable_work_sync(&ctrl->neigh_sync_work);
+	disable_delayed_work_sync(&ctrl->negative_work);
 
 	/* Unregistering stops new events, not the work already queued, and that
 	 * work walks this list. Wait for it before touching the list here: the
@@ -3999,6 +4064,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	INIT_DELAYED_WORK(&ctrl->resync_work, otto_l3_resync_work_do);
 	disable_delayed_work(&ctrl->resync_work);
 	INIT_WORK(&ctrl->neigh_sync_work, otto_l3_neigh_sync_work_do);
+	INIT_DELAYED_WORK(&ctrl->negative_work, otto_l3_negative_work_do);
 
 	match = of_match_node(otto_l3_of_ids, dev->of_node);
 	if (!match)
