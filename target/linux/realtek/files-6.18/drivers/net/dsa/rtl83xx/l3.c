@@ -10,8 +10,9 @@
  * The driver follows the kernel's routes through the FIB notifier and its
  * neighbours through the netevent notifier, and mirrors the routes whose
  * gateway sits behind a switch port, and the neighbours it reaches on-link
- * through a VLAN of the switch, into the switch, which then routes their
- * packets without the CPU. Only the local and main tables are taken.
+ * through a VLAN or a standalone port of the switch, into the switch, which
+ * then routes their packets without the CPU. Only the local and main tables
+ * are taken.
  *
  * Hardware logic. The families route in one of two ways (use_l3_tables in
  * struct otto_l3_config):
@@ -41,12 +42,13 @@
  * driver could not take, for want of memory, has the routes flushed and the
  * FIB replayed. A neighbour that fails to resolve is dropped in the switch for
  * 30 seconds. A router MAC entry is written for each VLAN device on the
- * switch that is up and has an address, matching on its VLAN only.
+ * switch that is up and has an address, matching on its VLAN only, and for
+ * each such standalone port, matching on the port.
  *
  * State per family:
  * - RTL930x: IPv4 and IPv6 unicast routes through a gateway are forwarded,
- *   and so are on-link neighbours on a VLAN of the switch, each through an
- *   entry of its own: a host route for IPv4, a /128 row for IPv6.
+ *   and so are on-link neighbours on a VLAN or a standalone port, each
+ *   through an entry of its own: a host route for IPv4, a /128 row for IPv6.
  *   The prefix table has 512 rows shared by both families; an IPv6 entry
  *   takes three, and at most two start in every eight rows. The driver takes
  *   up to 1536 host routes. Trapped to the CPU: addresses of the box, on-link
@@ -451,6 +453,7 @@ static void otto_l3_930x_get_router_mac(struct otto_l3_ctrl *ctrl,
 	m->p_id = (v >> 13) & 0x3f;  /* trunk id of port */
 	m->vid = v & 0xfff;
 	m->vid_mask = w & 0xfff;
+	m->p_id_mask = (w >> 13) & 0x3f;
 	m->action = data[6] & 0x7;
 	m->mac_mask = ((((u64)data[5]) << 32) & 0xffffffffffffULL) | data[4];
 	m->mac = ((((u64)data[1]) << 32) & 0xffffffffffffULL) | data[2];
@@ -819,10 +822,31 @@ static int otto_l3_port_lower_walk(struct net_device *lower, struct netdev_neste
 	return ret;
 }
 
+/* A switch port in no bridge or bond is an L3 interface of its own */
+static int otto_l3_standalone_port(struct otto_l3_ctrl *ctrl, struct net_device *dev)
+{
+	int port = rtl83xx_port_is_under(dev, ctrl->priv);
+	bool master;
+
+	if (port < 0)
+		return port;
+
+	rcu_read_lock();
+	master = netdev_master_upper_dev_get_rcu(dev);
+	rcu_read_unlock();
+
+	return master ? -EBUSY : port;
+}
+
 static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ctrl *ctrl)
 {
 	struct otto_l3_walk_data data;
 	struct netdev_nested_priv _priv;
+	int port;
+
+	port = otto_l3_standalone_port(ctrl, dev);
+	if (port >= 0)
+		return port;
 
 	data.ctrl = ctrl;
 	data.port = -EINVAL;
@@ -833,6 +857,21 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 	rcu_read_unlock();
 
 	return data.port;
+}
+
+/* The VLAN an L3 device of the switch routes in: its own for a VLAN device,
+ * the port's PVID for a standalone port
+ */
+static int otto_l3_dev_vid(struct otto_l3_ctrl *ctrl, struct net_device *dev)
+{
+	int port;
+
+	if (is_vlan_dev(dev))
+		return vlan_dev_vlan_id(dev);
+
+	port = otto_l3_standalone_port(ctrl, dev);
+
+	return port >= 0 ? ctrl->priv->ports[port].pvid : 0;
 }
 
 /* An address of the switch on a device, of either family */
@@ -856,7 +895,8 @@ static bool otto_l3_dev_has_addr(struct net_device *dev)
 /* On the RTL93xx a frame is only routed when its destination MAC and VLAN hit
  * an entry of the ROUTER_MAC table. The switch routes in the VLANs it has an
  * address in, so the table holds one entry per VLAN device on the switch that
- * is up and has an address of either family. A bridge without VLAN filtering
+ * is up and has an address of either family, matching on the VLAN, and one per
+ * such standalone port, matching on the port. A bridge without VLAN filtering
  * routes in the PVID of its ports, the VLAN its untagged frames are in. A frame
  * for the switch MAC in any other VLAN is bridged to the CPU as usual. Called
  * with RTNL held.
@@ -866,44 +906,57 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 	DECLARE_BITMAP(have, MAX_ROUTER_MACS) = {};
 	u64 macs[MAX_ROUTER_MACS];
 	u16 vids[MAX_ROUTER_MACS];
+	int ports[MAX_ROUTER_MACS];	/* -1 for a VLAN */
 	struct otto_l3_router_mac m;
 	struct net_device *dev;
 	int i, j, n = 0;
+	u64 untag = 0;
 
 	if (!ctrl->cfg->set_router_mac)
 		return;
 
 	for_each_netdev(&init_net, dev) {
 		u64 mac = ether_addr_to_u64(dev->dev_addr);
-		int port;
-		u16 vid;
+		int port = -1;
+		u16 vid = 0;
 
-		if (!(is_vlan_dev(dev) || (netif_is_bridge_master(dev) && !br_vlan_enabled(dev))) ||
-		    !(dev->flags & IFF_UP) || !otto_l3_dev_has_addr(dev))
+		if (!(dev->flags & IFF_UP) || !otto_l3_dev_has_addr(dev))
 			continue;
 
-		port = otto_l3_port_dev_lower_find(dev, ctrl);
-		if (port < 0)
-			continue;
+		if (is_vlan_dev(dev) || (netif_is_bridge_master(dev) && !br_vlan_enabled(dev))) {
+			int lower = otto_l3_port_dev_lower_find(dev, ctrl);
 
-		vid = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : ctrl->priv->ports[port].pvid;
-		if (!vid)
+			if (lower >= 0)
+				vid = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) :
+							 ctrl->priv->ports[lower].pvid;
+		} else {
+			port = otto_l3_standalone_port(ctrl, dev);
+		}
+		if (!vid && port < 0)
 			continue;
 
 		for (j = 0; j < n; j++)
-			if (macs[j] == mac && vids[j] == vid)
+			if (macs[j] == mac && vids[j] == vid && ports[j] == port)
 				break;
 		if (j < n)
 			continue;
 		if (n == MAX_ROUTER_MACS) {
-			dev_err(ctrl->dev, "more routed VLANs than router MACs\n");
+			dev_err(ctrl->dev, "more routed interfaces than router MACs\n");
 			break;
 		}
 		macs[n] = mac;
-		vids[n++] = vid;
+		vids[n] = vid;
+		ports[n++] = port;
+		if (port >= 0)
+			untag |= BIT_ULL(port);
 	}
 
 	mutex_lock(ctrl->lock);
+
+	/* VLAN 0, which the standalone ports share, is tagged on every port:
+	 * frames routed out of a standalone port would carry a VID 0 tag
+	 */
+	ctrl->priv->r->vlan_set_untagged(0, untag);
 
 	/* Keep the entries still wanted, clear the others */
 	for (i = 0; i < MAX_ROUTER_MACS; i++) {
@@ -911,9 +964,15 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 		ctrl->cfg->get_router_mac(ctrl, i, &m);
 		if (!m.valid)
 			continue;
-		for (j = 0; j < n; j++)
-			if (m.mac == macs[j] && m.vid == vids[j] && m.vid_mask == 0xfff)
+		for (j = 0; j < n; j++) {
+			if (m.mac != macs[j])
+				continue;
+			if (ports[j] < 0 && !m.p_id_mask && m.vid_mask == 0xfff && m.vid == vids[j])
 				break;
+			if (ports[j] >= 0 && m.p_id_mask == 0x3f && m.p_id == ports[j] &&
+			    !m.vid_mask)
+				break;
+		}
 		if (j < n && !test_and_set_bit(j, have))
 			continue;
 		m.valid = false;
@@ -931,7 +990,7 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 				break;
 		}
 		if (i == MAX_ROUTER_MACS) {
-			dev_err(ctrl->dev, "No free router MACs, VLAN %d is not routed\n", vids[j]);
+			dev_err(ctrl->dev, "No free router MACs, not all interfaces are routed\n");
 			break;
 		}
 
@@ -939,10 +998,15 @@ static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
 		m.valid = true;
 		m.mac = macs[j];
 		m.p_type = 0;			/* An individual port, not a trunk port */
-		m.p_id = 0x3f;			/* Listen on any port */
-		m.p_id_mask = 0;
-		m.vid = vids[j];		/* ... but only in this VLAN */
-		m.vid_mask = 0xfff;
+		if (ports[j] < 0) {
+			m.p_id = 0x3f;		/* Listen on any port */
+			m.p_id_mask = 0;
+			m.vid = vids[j];	/* ... but only in this VLAN */
+			m.vid_mask = 0xfff;
+		} else {
+			m.p_id = ports[j];	/* Listen on this port only, in any VLAN */
+			m.p_id_mask = 0x3f;
+		}
 		m.mac_mask = 0xffffffffffffULL;	/* We want an exact match of the interface MAC */
 		m.action = ROUTE_ACT_FORWARD;	/* Route the packet */
 		ctrl->cfg->set_router_mac(ctrl, i, &m);
@@ -1447,7 +1511,10 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 	char dst[INET6_ADDRSTRLEN + sizeof("/128")];
 	bool trapped = r->attr.action == ROUTE_ACT_TRAP2CPU;
 	bool first = !r->nh.mac;
+	struct net_device *dev;
 	bool no_port, trap;
+	int port = -ENODEV;
+	int err;
 
 	dev_dbg(ctrl->dev, "setting up fwding: gw %pI6c, mac %016llx\n",
 		&r->gw_ip, mac);
@@ -1468,8 +1535,18 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		otto_l3_route_rewrite(ctrl, r);
 	}
 
+	/* On a standalone port the next hop is behind that port. Its L2 entry
+	 * is written static with it rather than learnt: an entry with no port
+	 * floods every port of VLAN 0, which all standalone ports share.
+	 */
+	dev = dev_get_by_index(&init_net, r->gw_ifindex);
+	if (dev) {
+		port = otto_l3_standalone_port(ctrl, dev);
+		dev_put(dev);
+	}
+
 	r->nh.mac = r->nh.gw = mac;
-	r->nh.port = priv->r->port_ignore;
+	r->nh.port = port >= 0 ? port : priv->r->port_ignore;
 	r->nh.id = r->id;
 
 	/* Do we need to explicitly add a DMAC entry with the route's nh index? */
@@ -1477,17 +1554,20 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 		ctrl->cfg->set_egress_mac(ctrl, r->id, mac);
 
 	/* Update ROUTING table: map gateway-mac and switch-mac id to route id */
-	if (!rtldsa_l2_nexthop_add(priv, &r->nh, require_existing))
+	err = rtldsa_l2_nexthop_add(priv, &r->nh, require_existing && port < 0);
+	if (!err)
 		r->nh.l2_installed = true;
 
 	/* A next hop with no port delivers the frame twice, so where the
 	 * route entry can trap, let the CPU route it alone until an update
 	 * brings one, the way otto_l3_fib_add_v4() treats a host route
-	 * with no gateway. A family that routes through a PIE rule keeps
-	 * the rule it had.
+	 * with no gateway. The same holds for a next hop that got no L2
+	 * entry, such as one whose MAC is a next hop on another standalone
+	 * port already. A family that routes through a PIE rule keeps the
+	 * rule it had.
 	 */
 	no_port = ctrl->cfg->use_l3_tables &&
-		  r->nh.port == priv->r->port_ignore;
+		  (err || r->nh.port == priv->r->port_ignore);
 	if (no_port && (first || !trapped)) {
 		if (r->attr.type == ROUTE_TYPE_IP4UC)
 			dev_info(ctrl->dev, "no port for %pI4, routing %s in software\n",
@@ -2147,7 +2227,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	nh = fib_info_nh(info->fi, 0);
 	ndev = nh->fib_nh_dev;
-	vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
+	vlan = otto_l3_dev_vid(ctrl, ndev);
 
 	if (otto_l3_fib_check_v4(ctrl, info, FIB_EVENT_ENTRY_ADD))
 		return 0;
@@ -2633,7 +2713,7 @@ static int otto_l3_fib_add_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 	if (port < 0)
 		goto not_offloaded;
 
-	vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
+	vlan = otto_l3_dev_vid(ctrl, ndev);
 
 	route = otto_l3_route_alloc(ctrl, gw, ROUTE_PREFIX);
 	if (!route) {
@@ -3107,9 +3187,10 @@ static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 	dev = dev_get_by_index(&init_net, ifindex);
 	if (!dev)
 		return false;
-	if (!is_vlan_dev(dev) || !otto_l3_neigh_on_link(type, addr, dev))
+	if ((!is_vlan_dev(dev) && otto_l3_standalone_port(ctrl, dev) < 0) ||
+	    !otto_l3_neigh_on_link(type, addr, dev))
 		goto out;
-	vlan = vlan_dev_vlan_id(dev);
+	vlan = otto_l3_dev_vid(ctrl, dev);
 
 	r = otto_l3_route_alloc(ctrl, addr,
 				type == ROUTE_TYPE_IP4UC && ctrl->cfg->host_route_write ?

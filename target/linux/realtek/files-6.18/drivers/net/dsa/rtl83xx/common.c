@@ -453,6 +453,17 @@ int rtldsa_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct otto_l3_nexth
 		return -ENOENT;
 	}
 
+	/* A next hop on a standalone port comes with its port. All standalone
+	 * ports share one VLAN, so the entry cannot also point at another one.
+	 */
+	if (nh->port != priv->r->port_ignore && e.valid && e.port != nh->port &&
+	    e.port != priv->r->port_ignore && (e.next_hop || e.is_static)) {
+		if (nh->l2_installed)
+			rtldsa_l2_uc_put_row(priv, nh);
+		nh->l2_installed = false;
+		return -EBUSY;
+	}
+
 	/* Found an existing (e->valid is true) or empty entry, make it a nexthop entry */
 	if (nh->l2_installed && nh->l2_id != idx)
 		rtldsa_l2_uc_put_row(priv, nh);
@@ -471,20 +482,26 @@ int rtldsa_l2_nexthop_add(struct rtl838x_switch_priv *priv, struct otto_l3_nexth
 
 	nh->l2_id = idx;
 	nh->l2_seed = seed;
-	if (e.valid) {
+	if (e.valid && nh->port == priv->r->port_ignore) {
 		nh->port = e.port;
 		nh->rvid = e.rvid;
 		nh->dev_id = e.stack_dev;
 		/* If the entry is already a valid next hop entry, don't change it */
 		if (e.next_hop)
 			return 0;
+	} else if (e.valid && e.next_hop && e.is_static) {
+		/* Another route on the same standalone port already set it up */
+		return 0;
 	} else {
+		/* Static, so that a standalone port's next hop keeps its port
+		 * instead of ageing into a flood
+		 */
 		memset(&e, 0, sizeof(e));
 		e.type = L2_UNICAST;
 		e.valid = true;
 		e.is_static = true;
 		e.rvid = nh->rvid;
-		e.port = priv->r->port_ignore;
+		e.port = nh->port;
 		u64_to_ether_addr(nh->mac, &e.mac[0]);
 	}
 	e.next_hop = true;
