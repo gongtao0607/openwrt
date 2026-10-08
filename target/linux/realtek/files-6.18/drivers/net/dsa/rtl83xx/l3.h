@@ -140,6 +140,10 @@ struct otto_l3_ctrl {
 	struct rtl838x_switch_priv *priv;
 	struct notifier_block fib_nb;
 	struct notifier_block ne_nb;
+	struct notifier_block netdev_nb;	/* these three: router MACs */
+	struct notifier_block inetaddr_nb;
+	struct notifier_block inet6addr_nb;
+	struct work_struct router_mac_work;
 	struct delayed_work resync_work;
 	struct work_struct neigh_sync_work;
 	struct delayed_work negative_work;

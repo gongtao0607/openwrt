@@ -40,7 +40,8 @@
  * entries of that family into traps until those rules are gone. An event the
  * driver could not take, for want of memory, has the routes flushed and the
  * FIB replayed. A neighbour that fails to resolve is dropped in the switch for
- * 30 seconds.
+ * 30 seconds. A router MAC entry is written for each VLAN device on the
+ * switch that is up and has an address, matching on its VLAN only.
  *
  * State per family:
  * - RTL930x: IPv4 and IPv6 unicast routes through a gateway are forwarded,
@@ -65,6 +66,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
@@ -72,6 +74,7 @@
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/seq_file.h>
+#include <net/addrconf.h>
 #include <net/arp.h>
 #include <net/fib_notifier.h>
 #include <net/ip6_fib.h>
@@ -464,7 +467,7 @@ static void otto_l3_930x_set_router_mac(struct otto_l3_ctrl *ctrl,
 	u32 data[7];
 	u32 v, w;
 
-	v = BIT(20); /* mac entry valid, port type is 0: individual */
+	v = m->valid ? BIT(20) : 0; /* port type is 0: individual */
 	v |= (m->p_id & 0x3f) << 13;
 	v |= (m->vid & 0xfff); /* Set the interface_id to the vlan id */
 
@@ -832,47 +835,121 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 	return data.port;
 }
 
-/* On the RTL93xx, an L3 termination endpoint MAC address on which the router waits
- * for packets to be routed needs to be allocated.
- */
-static int otto_l3_alloc_router_mac(struct otto_l3_ctrl *ctrl, u64 mac)
+/* An address of the switch on a device, of either family */
+static bool otto_l3_dev_has_addr(struct net_device *dev)
 {
-	struct otto_l3_router_mac m;
-	int free_mac = -1;
+	struct in_device *in_dev = __in_dev_get_rtnl(dev);
 
-	mutex_lock(ctrl->lock);
-	for (int i = 0; i < MAX_ROUTER_MACS; i++) {
-		ctrl->cfg->get_router_mac(ctrl, i, &m);
-		if (free_mac < 0 && !m.valid) {
-			free_mac = i;
+	if (in_dev && rtnl_dereference(in_dev->ifa_list))
+		return true;
+#if IS_ENABLED(CONFIG_IPV6)
+	{
+		struct inet6_dev *in6_dev = __in6_dev_get(dev);
+
+		if (in6_dev && !list_empty(&in6_dev->addr_list))
+			return true;
+	}
+#endif
+	return false;
+}
+
+/* On the RTL93xx a frame is only routed when its destination MAC and VLAN hit
+ * an entry of the ROUTER_MAC table. The switch routes in the VLANs it has an
+ * address in, so the table holds one entry per VLAN device on the switch that
+ * is up and has an address of either family. A bridge without VLAN filtering
+ * routes in the PVID of its ports, the VLAN its untagged frames are in. A frame
+ * for the switch MAC in any other VLAN is bridged to the CPU as usual. Called
+ * with RTNL held.
+ */
+static void otto_l3_router_macs_update(struct otto_l3_ctrl *ctrl)
+{
+	DECLARE_BITMAP(have, MAX_ROUTER_MACS) = {};
+	u64 macs[MAX_ROUTER_MACS];
+	u16 vids[MAX_ROUTER_MACS];
+	struct otto_l3_router_mac m;
+	struct net_device *dev;
+	int i, j, n = 0;
+
+	if (!ctrl->cfg->set_router_mac)
+		return;
+
+	for_each_netdev(&init_net, dev) {
+		u64 mac = ether_addr_to_u64(dev->dev_addr);
+		int port;
+		u16 vid;
+
+		if (!(is_vlan_dev(dev) || (netif_is_bridge_master(dev) && !br_vlan_enabled(dev))) ||
+		    !(dev->flags & IFF_UP) || !otto_l3_dev_has_addr(dev))
 			continue;
-		}
-		if (m.valid && m.mac == mac) {
-			free_mac = i;
+
+		port = otto_l3_port_dev_lower_find(dev, ctrl);
+		if (port < 0)
+			continue;
+
+		vid = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : ctrl->priv->ports[port].pvid;
+		if (!vid)
+			continue;
+
+		for (j = 0; j < n; j++)
+			if (macs[j] == mac && vids[j] == vid)
+				break;
+		if (j < n)
+			continue;
+		if (n == MAX_ROUTER_MACS) {
+			dev_err(ctrl->dev, "more routed VLANs than router MACs\n");
 			break;
 		}
+		macs[n] = mac;
+		vids[n++] = vid;
 	}
 
-	if (free_mac < 0) {
-		dev_err(ctrl->dev, "No free router MACs, cannot offload\n");
-		mutex_unlock(ctrl->lock);
-		return -1;
+	mutex_lock(ctrl->lock);
+
+	/* Keep the entries still wanted, clear the others */
+	for (i = 0; i < MAX_ROUTER_MACS; i++) {
+		memset(&m, 0, sizeof(m));
+		ctrl->cfg->get_router_mac(ctrl, i, &m);
+		if (!m.valid)
+			continue;
+		for (j = 0; j < n; j++)
+			if (m.mac == macs[j] && m.vid == vids[j] && m.vid_mask == 0xfff)
+				break;
+		if (j < n && !test_and_set_bit(j, have))
+			continue;
+		m.valid = false;
+		ctrl->cfg->set_router_mac(ctrl, i, &m);
 	}
 
-	m.valid = true;
-	m.mac = mac;
-	m.p_type = 0; /* An individual port, not a trunk port */
-	m.p_id = 0x3f;			/* Listen on any port */
-	m.p_id_mask = 0;
-	m.vid = 0;			/* Listen on any VLAN... */
-	m.vid_mask = 0;			/* ... so mask needs to be 0 */
-	m.mac_mask = 0xffffffffffffULL;	/* We want an exact match of the interface MAC */
-	m.action = ROUTE_ACT_FORWARD;	/* Route the packet */
-	ctrl->cfg->set_router_mac(ctrl, free_mac, &m);
+	/* Add the missing ones in free entries */
+	for (i = 0, j = 0; j < n; j++) {
+		if (test_bit(j, have))
+			continue;
+		for (; i < MAX_ROUTER_MACS; i++) {
+			memset(&m, 0, sizeof(m));
+			ctrl->cfg->get_router_mac(ctrl, i, &m);
+			if (!m.valid)
+				break;
+		}
+		if (i == MAX_ROUTER_MACS) {
+			dev_err(ctrl->dev, "No free router MACs, VLAN %d is not routed\n", vids[j]);
+			break;
+		}
+
+		memset(&m, 0, sizeof(m));
+		m.valid = true;
+		m.mac = macs[j];
+		m.p_type = 0;			/* An individual port, not a trunk port */
+		m.p_id = 0x3f;			/* Listen on any port */
+		m.p_id_mask = 0;
+		m.vid = vids[j];		/* ... but only in this VLAN */
+		m.vid_mask = 0xfff;
+		m.mac_mask = 0xffffffffffffULL;	/* We want an exact match of the interface MAC */
+		m.action = ROUTE_ACT_FORWARD;	/* Route the packet */
+		ctrl->cfg->set_router_mac(ctrl, i, &m);
+		i++;
+	}
 
 	mutex_unlock(ctrl->lock);
-
-	return 0;
 }
 
 /* Read back an egress interface descriptor, the layout written below. */
@@ -2129,14 +2206,9 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (ctrl->cfg->set_router_mac) {
 		u64 mac = ether_addr_to_u64(ndev->dev_addr);
 
-		dev_dbg(ctrl->dev, "Local route and router MAC %pM\n", ndev->dev_addr);
-		if (otto_l3_alloc_router_mac(ctrl, mac))
-			goto out_free_rt;
-
-		/* vid = 0: Do not care about VID */
 		route->nh.if_id = otto_l3_alloc_egress_intf(ctrl, mac, vlan);
 		if (route->nh.if_id < 0)
-			goto out_free_rmac;
+			goto out_free_rt;
 
 		if (!nh->fib_nh_gw4 && route->is_host_route) {
 			route->nh.mac = mac;
@@ -2166,7 +2238,6 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	return 0;
 
-out_free_rmac:
 out_free_rt:
 	otto_l3_route_put_intf(ctrl, route);
 	otto_l3_route_free(ctrl, route);
@@ -2580,9 +2651,6 @@ static int otto_l3_fib_add_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 	if (ctrl->cfg->set_router_mac) {
 		u64 mac = ether_addr_to_u64(ndev->dev_addr);
 
-		if (otto_l3_alloc_router_mac(ctrl, mac))
-			goto out_failed;
-
 		route->nh.if_id = otto_l3_alloc_egress_intf(ctrl, mac, vlan);
 		if (route->nh.if_id < 0)
 			goto out_failed;
@@ -2851,6 +2919,56 @@ static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 		if (dev)
 			otto_l3_port_gw_resolve(ctrl, dev, tbl, &r->gw_ip);
 	}
+}
+
+static void otto_l3_router_mac_work_do(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(work, struct otto_l3_ctrl, router_mac_work);
+
+	rtnl_lock();
+	otto_l3_router_macs_update(ctrl);
+	rtnl_unlock();
+}
+
+/* The router MACs follow the switch's addresses and the state of its VLAN
+ * devices. The FIB does not tell: of several devices that hold one address,
+ * as the VLAN devices of a bridge hold its IPv6 link-local address, only
+ * the device whose local route the FIB happens to keep first is ever
+ * announced. The three notifiers only queue the update, two of them are
+ * called in atomic context.
+ */
+static int otto_l3_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	struct otto_l3_ctrl *ctrl = container_of(nb, struct otto_l3_ctrl, netdev_nb);
+
+	switch (event) {
+	case NETDEV_UP:
+	case NETDEV_DOWN:
+	case NETDEV_CHANGEADDR:
+	case NETDEV_CHANGEUPPER:
+	case NETDEV_UNREGISTER:
+		queue_work(ctrl->priv->wq, &ctrl->router_mac_work);
+	}
+
+	return NOTIFY_DONE;
+}
+
+static int otto_l3_inetaddr_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	struct otto_l3_ctrl *ctrl = container_of(nb, struct otto_l3_ctrl, inetaddr_nb);
+
+	queue_work(ctrl->priv->wq, &ctrl->router_mac_work);
+
+	return NOTIFY_DONE;
+}
+
+static int otto_l3_inet6addr_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	struct otto_l3_ctrl *ctrl = container_of(nb, struct otto_l3_ctrl, inet6addr_nb);
+
+	queue_work(ctrl->priv->wq, &ctrl->router_mac_work);
+
+	return NOTIFY_DONE;
 }
 
 /* The kernel sends a packet for this address straight to the neighbour: the
@@ -3955,6 +4073,14 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 		unregister_fib_notifier(&init_net, &ctrl->fib_nb);
 		ctrl->fib_nb.notifier_call = NULL;
 	}
+	if (ctrl->netdev_nb.notifier_call) {
+		unregister_netdevice_notifier(&ctrl->netdev_nb);
+		unregister_inetaddr_notifier(&ctrl->inetaddr_nb);
+		if (IS_ENABLED(CONFIG_IPV6))
+			unregister_inet6addr_notifier(&ctrl->inet6addr_nb);
+		ctrl->netdev_nb.notifier_call = NULL;
+	}
+	disable_work_sync(&ctrl->router_mac_work);
 	disable_work_sync(&ctrl->neigh_sync_work);
 	disable_delayed_work_sync(&ctrl->negative_work);
 
@@ -4063,6 +4189,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	/* Until the FIB notifier is in place there is nothing to replay */
 	INIT_DELAYED_WORK(&ctrl->resync_work, otto_l3_resync_work_do);
 	disable_delayed_work(&ctrl->resync_work);
+	INIT_WORK(&ctrl->router_mac_work, otto_l3_router_mac_work_do);
 	INIT_WORK(&ctrl->neigh_sync_work, otto_l3_neigh_sync_work_do);
 	INIT_DELAYED_WORK(&ctrl->negative_work, otto_l3_negative_work_do);
 
@@ -4098,6 +4225,25 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 		ctrl->ne_nb.notifier_call = NULL;
 		otto_l3_remove(priv);
 		return dev_err_probe(dev, err, "Failed to register netevent notifier\n");
+	}
+
+	/* Registering replays the devices that are there, which sets the
+	 * router MACs up
+	 */
+	if (ctrl->cfg->set_router_mac) {
+		ctrl->netdev_nb.notifier_call = otto_l3_netdev_event;
+		ctrl->inetaddr_nb.notifier_call = otto_l3_inetaddr_event;
+		ctrl->inet6addr_nb.notifier_call = otto_l3_inet6addr_event;
+		err = register_netdevice_notifier(&ctrl->netdev_nb);
+		if (!err) {
+			register_inetaddr_notifier(&ctrl->inetaddr_nb);
+			if (IS_ENABLED(CONFIG_IPV6))
+				register_inet6addr_notifier(&ctrl->inet6addr_nb);
+		} else {
+			ctrl->netdev_nb.notifier_call = NULL;
+			otto_l3_remove(priv);
+			return dev_err_probe(dev, err, "Failed to register netdevice notifier\n");
+		}
 	}
 
 	/*
