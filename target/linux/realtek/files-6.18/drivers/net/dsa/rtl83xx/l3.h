@@ -7,9 +7,12 @@
 #ifndef _OTTO_L3_H
 #define _OTTO_L3_H
 
+#include <net/dscp.h>
+
 #include "l3_limits.h"
 #include "rtl-otto.h"
 
+struct fib_info;
 struct fib6_info;
 
 #define MAX_SMACS 64
@@ -80,6 +83,9 @@ struct otto_l3_nexthop {
 
 struct otto_l3_route {
 	struct fib6_info *f6i;		/* FIB entry to report the offload on */
+	struct fib_info *fi;		/* ... the same for IPv4, with the rest of */
+	dscp_t dscp;			/* the alias it is found by */
+	u8 fib_type;
 	struct in6_addr gw_ip;		/* Gateway of the route, IPv4 v4-mapped */
 	int gw_ifindex;			/* Device the gateway is reached on */
 	u32 dst_ip;			/* IP of the destination net */

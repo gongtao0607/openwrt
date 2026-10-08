@@ -1500,6 +1500,61 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	otto_l3_route_rewrite(ctrl, r);
 }
 
+/* What the switch does with an IPv4 route, as iproute2 shows it: offload when
+ * it forwards it, trap when it hands its packets to the CPU, offload_failed
+ * when it should hold it and has no room for it.
+ */
+static void otto_l3_fib4_flags_set(struct fib_info *fi, u32 tb_id, __be32 dst, int dst_len,
+				   dscp_t dscp, u8 type, bool offload, bool trap, bool failed)
+{
+	struct fib_rt_info fri = {
+		.fi = fi,
+		.tb_id = tb_id,
+		.dst = dst,
+		.dst_len = dst_len,
+		.dscp = dscp,
+		.type = type,
+		.offload = offload,
+		.trap = trap,
+		.offload_failed = failed,
+	};
+
+	fib_alias_hw_flags_set(&init_net, &fri);
+}
+
+/* The FIB alias an IPv4 route reports its state on */
+static void otto_l3_route_fib4_set(struct otto_l3_route *r, struct fib_entry_notifier_info *info)
+{
+	r->fi = info->fi;
+	fib_info_hold(r->fi);
+	r->dscp = info->dscp;
+	r->fib_type = info->type;
+}
+
+/* Tells the kernel what the switch now does with a route. A route takes its
+ * entry when it is added, so one still without it is one that could not be
+ * placed. Reporting allocates and can send a netlink message. It takes no
+ * lock of its own, so unlike the FIB work this path needs no rtnl. The FIB
+ * notifier is registered on init_net, which is where every route here comes
+ * from.
+ */
+static void otto_l3_route_report(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
+{
+	bool trap = r->attr.action == ROUTE_ACT_TRAP2CPU;
+	bool placed = !ctrl->cfg->use_l3_tables;
+
+	if (!placed && r->is_host_route)
+		placed = otto_l3_host_shadowed(ctrl, r) || ctrl->cfg->find_slot(ctrl, r, true) >= 0;
+	else if (!placed)
+		placed = r->row >= FIRST_PREFIX_ROW;
+
+	if (r->fi)
+		otto_l3_fib4_flags_set(r->fi, r->tb_id, r->dst_ip, r->prefix_len, r->dscp,
+				       r->fib_type, placed && !trap, placed && trap, !placed);
+	if (IS_REACHABLE(CONFIG_IPV6) && r->f6i)
+		fib6_info_hw_flags_set(&init_net, r->f6i, placed && !trap, placed && trap, !placed);
+}
+
 /* Updates an L3 next hop entry in the ROUTING table */
 static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 				  const struct in6_addr *gw, u64 mac, bool valid)
@@ -1528,34 +1583,10 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 	if (!known)
 		return -ENOENT;
 
-	/* An address of one family can be written as an address of the other,
-	 * so a neighbour of the wrong family reaches this far without having
-	 * placed anything, and has nothing to report.
-	 */
-	if (type != ROUTE_TYPE_IP6UC)
-		return 0;
-
-	/* Reporting the offload allocates and can send a netlink message. It
-	 * takes no lock of its own, so unlike the FIB work this path needs no
-	 * rtnl. The FIB notifier is registered on init_net, which is where
-	 * every route here comes from.
-	 */
-	list_for_each_entry(r, &ctrl->routes_list, list) {
-		bool trap;
-
-		if (!IS_REACHABLE(CONFIG_IPV6) || !r->f6i || r->gw_ifindex != ifindex ||
-		    !ipv6_addr_equal(&r->gw_ip, gw))
-			continue;
-
-		/* A route takes its row when it is added, so one still without a
-		 * row is one that could not be placed.
-		 */
-		trap = r->attr.action == ROUTE_ACT_TRAP2CPU;
-		if (r->row >= FIRST_PREFIX_ROW)
-			fib6_info_hw_flags_set(&init_net, r->f6i, !trap, trap, false);
-		else
-			fib6_info_hw_flags_set(&init_net, r->f6i, false, false, true);
-	}
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->attr.type == type && r->gw_ifindex == ifindex &&
+		    ipv6_addr_equal(&r->gw_ip, gw))
+			otto_l3_route_report(ctrl, r);
 
 	return 0;
 }
@@ -1691,6 +1722,12 @@ static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
 	else
 		clear_bit(r->id, ctrl->route_use_bm);
+
+	if (r->fi) {
+		otto_l3_fib4_flags_set(r->fi, r->tb_id, r->dst_ip, r->prefix_len, r->dscp,
+				       r->fib_type, false, false, false);
+		fib_info_put(r->fi);
+	}
 
 	if (IS_REACHABLE(CONFIG_IPV6) && r->f6i) {
 		fib6_info_hw_flags_set(&init_net, r->f6i, false, false, false);
@@ -1883,9 +1920,15 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 	route->attr.valid = true;
 	route->attr.action = ROUTE_ACT_TRAP2CPU;
 	route->attr.type = ROUTE_TYPE_IP4UC;
+	otto_l3_route_fib4_set(route, info);
 
-	if (otto_l3_route_install(ctrl, route))
+	if (otto_l3_route_install(ctrl, route)) {
 		otto_l3_route_free(ctrl, route);
+		otto_l3_fib4_flags_set(info->fi, info->tb_id, info->dst, info->dst_len,
+				       info->dscp, info->type, false, false, true);
+		return;
+	}
+	otto_l3_route_report(ctrl, route);
 }
 
 /* A route this driver leaves out still has to keep a shorter prefix in
@@ -1911,6 +1954,8 @@ static void otto_l3_fib_trap_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_noti
 	route = otto_l3_route_alloc(ctrl, &gw, ROUTE_PREFIX);
 	if (!route) {
 		dev_err(ctrl->dev, "no row to trap %pI4/%d\n", &info->dst, info->dst_len);
+		otto_l3_fib4_flags_set(info->fi, info->tb_id, info->dst, info->dst_len,
+				       info->dscp, info->type, false, false, true);
 		return;
 	}
 
@@ -1920,15 +1965,19 @@ static void otto_l3_fib_trap_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_noti
 	route->attr.type = ROUTE_TYPE_IP4UC;
 	route->attr.action = ROUTE_ACT_TRAP2CPU;
 	route->attr.valid = true;
+	otto_l3_route_fib4_set(route, info);
 
 	route->row = otto_l3_route_place(ctrl, route);
 	if (route->row < FIRST_PREFIX_ROW) {
 		dev_err(ctrl->dev, "no row to trap %pI4/%d\n", &info->dst, info->dst_len);
 		otto_l3_route_teardown(ctrl, route);
+		otto_l3_fib4_flags_set(info->fi, info->tb_id, info->dst, info->dst_len,
+				       info->dscp, info->type, false, false, true);
 		return;
 	}
 
 	ctrl->cfg->route_write(ctrl, route->row, route);
+	otto_l3_route_report(ctrl, route);
 }
 
 static void otto_l3_route_trap_new(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
@@ -2017,6 +2066,8 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	else {
 		dev_err(ctrl->dev, "could not allocate a route for gw %pI4\n",
 			&nh->fib_nh_gw4);
+		otto_l3_fib4_flags_set(info->fi, info->tb_id, info->dst, info->dst_len,
+				       info->dscp, info->type, false, false, true);
 		return -ENOSPC;
 	}
 
@@ -2026,6 +2077,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	route->attr.type = ROUTE_TYPE_IP4UC;
 	route->nh.rvid = vlan;
 	route->gw_ifindex = ndev->ifindex;
+	otto_l3_route_fib4_set(route, info);
 
 	if (ctrl->cfg->set_router_mac) {
 		u64 mac = ether_addr_to_u64(ndev->dev_addr);
@@ -2059,12 +2111,11 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	 */
 	if (ctrl->cfg->use_l3_tables && (nh->fib_nh_gw4 || !route->is_host_route))
 		otto_l3_route_trap_new(ctrl, route);
+	otto_l3_route_report(ctrl, route);
 
 	/* We need to resolve the mac address of the GW */
 	if (nh->fib_nh_gw4)
 		otto_l3_port_gw_resolve(ctrl, ndev, &arp_tbl, &gw);
-
-	nh->fib_nh_flags |= RTNH_F_OFFLOAD;
 
 	return 0;
 
@@ -2072,6 +2123,8 @@ out_free_rmac:
 out_free_rt:
 	otto_l3_route_put_intf(ctrl, route);
 	otto_l3_route_free(ctrl, route);
+	otto_l3_fib4_flags_set(info->fi, info->tb_id, info->dst, info->dst_len,
+			       info->dscp, info->type, false, false, true);
 	return 0;
 }
 
@@ -2107,7 +2160,6 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 				   info->dst_len);
 	if (ctrl->cfg->use_l3_tables && route && !route->gw_ip.s6_addr32[3]) {
 		otto_l3_route_teardown(ctrl, route);
-		nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
 		return 0;
 	}
 
@@ -2122,8 +2174,6 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 		 route->id, route->nh.id);
 
 	otto_l3_route_teardown(ctrl, route);
-
-	nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
 
 	return 0;
 }
@@ -2746,8 +2796,7 @@ static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 			r->attr.ttl_dec = false;
 			r->attr.ttl_check = false;
 			otto_l3_route_rewrite(ctrl, r);
-			if (IS_REACHABLE(CONFIG_IPV6) && r->f6i && r->row >= FIRST_PREFIX_ROW)
-				fib6_info_hw_flags_set(&init_net, r->f6i, false, true, false);
+			otto_l3_route_report(ctrl, r);
 			continue;
 		}
 
