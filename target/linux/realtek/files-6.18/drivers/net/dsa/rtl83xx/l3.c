@@ -9,7 +9,8 @@
  *
  * The driver follows the kernel's routes through the FIB notifier and its
  * neighbours through the netevent notifier, and mirrors the routes whose
- * gateway sits behind a switch port into the switch, which then routes their
+ * gateway sits behind a switch port, and the neighbours it reaches on-link
+ * through a VLAN of the switch, into the switch, which then routes their
  * packets without the CPU. Only the local and main tables are taken.
  *
  * Hardware logic. The families route in one of two ways (use_l3_tables in
@@ -41,7 +42,9 @@
  * FIB replayed.
  *
  * State per family:
- * - RTL930x: IPv4 and IPv6 unicast routes through a gateway are forwarded.
+ * - RTL930x: IPv4 and IPv6 unicast routes through a gateway are forwarded,
+ *   and so are on-link neighbours on a VLAN of the switch, each through an
+ *   entry of its own: a host route for IPv4, a /128 row for IPv6.
  *   The prefix table has 512 rows shared by both families; an IPv6 entry
  *   takes three, and at most two start in every eight rows. The driver takes
  *   up to 1536 host routes. Trapped to the CPU: addresses of the box, on-link
@@ -71,6 +74,7 @@
 #include <net/arp.h>
 #include <net/fib_notifier.h>
 #include <net/ip6_fib.h>
+#include <net/ipv6_stubs.h>
 #include <net/ndisc.h>
 #include <net/netevent.h>
 #include <net/nexthop.h>
@@ -121,6 +125,7 @@ struct otto_l3_net_event_work {
 	struct in6_addr gw_addr;
 	int ifindex;
 	bool valid;
+	bool sync;	/* from otto_l3_neigh_sync_work_do(), not an event */
 	u8 type;
 };
 
@@ -1533,6 +1538,39 @@ static void otto_l3_route_fib4_set(struct otto_l3_route *r, struct fib_entry_not
 	r->fib_type = info->type;
 }
 
+/* A neighbour the switch forwards to is marked offloaded */
+static void otto_l3_neigh_flags_set(struct otto_l3_route *r, bool offloaded)
+{
+	struct neigh_table *tbl = &arp_tbl;
+	const void *key = &r->gw_ip.s6_addr32[3];
+	struct net_device *dev;
+	struct neighbour *n;
+
+	if (r->attr.type == ROUTE_TYPE_IP6UC) {
+		if (!IS_REACHABLE(CONFIG_IPV6))
+			return;
+		tbl = &nd_tbl;
+		key = &r->gw_ip;
+	}
+
+	dev = dev_get_by_index(&init_net, r->gw_ifindex);
+	if (!dev)
+		return;
+
+	n = neigh_lookup(tbl, key, dev);
+	if (n) {
+		write_lock_bh(&n->lock);
+		if (offloaded)
+			n->flags |= NTF_OFFLOADED;
+		else
+			n->flags &= ~NTF_OFFLOADED;
+		write_unlock_bh(&n->lock);
+		neigh_release(n);
+	}
+
+	dev_put(dev);
+}
+
 /* Tells the kernel what the switch now does with a route. A route takes its
  * entry when it is added, so one still without it is one that could not be
  * placed. Reporting allocates and can send a netlink message. It takes no
@@ -1550,6 +1588,8 @@ static void otto_l3_route_report(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 	else if (!placed)
 		placed = r->row >= FIRST_PREFIX_ROW;
 
+	if (r->is_neigh)
+		otto_l3_neigh_flags_set(r, placed && r->attr.action == ROUTE_ACT_FORWARD);
 	if (r->fi)
 		otto_l3_fib4_flags_set(r->fi, r->tb_id, r->dst_ip, r->prefix_len, r->dscp,
 				       r->fib_type, placed && !trap, placed && trap, !placed);
@@ -1672,7 +1712,7 @@ static struct otto_l3_route *otto_l3_route_find(struct otto_l3_ctrl *ctrl, u32 t
 	struct otto_l3_route *r;
 
 	list_for_each_entry(r, &ctrl->routes_list, list) {
-		if (r->tb_id != tb_id || r->attr.type != type ||
+		if (r->is_neigh || r->tb_id != tb_id || r->attr.type != type ||
 		    r->prefix_len != prefix_len)
 			continue;
 
@@ -1724,6 +1764,9 @@ static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
 	else
 		clear_bit(r->id, ctrl->route_use_bm);
+
+	if (r->is_neigh)
+		otto_l3_neigh_flags_set(r, false);
 
 	if (r->fi) {
 		otto_l3_fib4_flags_set(r->fi, r->tb_id, r->dst_ip, r->prefix_len, r->dscp,
@@ -2808,12 +2851,167 @@ static void otto_l3_rules_check(struct otto_l3_ctrl *ctrl, int family)
 	}
 }
 
+/* The kernel sends a packet for this address straight to the neighbour: the
+ * route main has for it is on-link, out of the neighbour's own device.
+ */
+static bool otto_l3_neigh_on_link(u8 type, const struct in6_addr *addr, struct net_device *dev)
+{
+	bool on_link = false;
+
+	rcu_read_lock();
+	if (type == ROUTE_TYPE_IP4UC) {
+		struct fib_table *tb = fib_get_table(&init_net, RT_TABLE_MAIN);
+		struct flowi4 fl4 = { .daddr = addr->s6_addr32[3] };
+		struct fib_result res;
+
+		if (tb && !fib_table_lookup(tb, &fl4, &res, FIB_LOOKUP_NOREF))
+			on_link = res.type == RTN_UNICAST && fib_info_num_path(res.fi) == 1 &&
+				  !res.nhc->nhc_gw_family && res.nhc->nhc_dev == dev;
+	}
+#if IS_ENABLED(CONFIG_IPV6)
+	if (type == ROUTE_TYPE_IP6UC) {
+		struct fib6_table *tb = ipv6_stub->fib6_get_table(&init_net, RT6_TABLE_MAIN);
+		struct flowi6 fl6 = { .daddr = *addr };
+		struct fib6_result res = {};
+
+		if (tb && !ipv6_stub->fib6_table_lookup(&init_net, tb, 0, &fl6, &res, 0))
+			on_link = res.f6i != init_net.ipv6.fib6_null_entry &&
+				  res.fib6_type == RTN_UNICAST && !res.nh->fib_nh_gw_family &&
+				  res.nh->fib_nh_dev == dev;
+	}
+#endif
+	rcu_read_unlock();
+
+	return on_link;
+}
+
+static struct otto_l3_route *otto_l3_neigh_find(struct otto_l3_ctrl *ctrl, u8 type,
+						const struct in6_addr *addr)
+{
+	struct otto_l3_route *r;
+
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->is_neigh && r->attr.type == type && ipv6_addr_equal(&r->gw_ip, addr))
+			return r;
+
+	return NULL;
+}
+
+/* A FIB route for exactly this address takes the entry over */
+static void otto_l3_neigh_evict(struct otto_l3_ctrl *ctrl, u8 type, const struct in6_addr *addr,
+				int prefix_len)
+{
+	struct otto_l3_route *r;
+
+	if (prefix_len != (type == ROUTE_TYPE_IP4UC ? 32 : 128))
+		return;
+
+	r = otto_l3_neigh_find(ctrl, type, addr);
+	if (r)
+		otto_l3_route_teardown(ctrl, r);
+}
+
+/* A neighbour the kernel reaches on-link through a VLAN of the switch gets an
+ * entry of its own, with itself as the gateway: otto_l3_nexthop_update()
+ * forwards it like any route through a gateway, and the neighbour going away
+ * takes it out again, so that the trap of the on-link prefix hands the host's
+ * packets back to the CPU. IPv4 neighbours go to the host table, IPv6 ones to
+ * the prefix table, where the driver keeps every IPv6 destination. Nothing is
+ * ever routed to a link-local neighbour. Returns whether an entry was added.
+ */
+static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
+			      const struct in6_addr *addr)
+{
+	int plen = type == ROUTE_TYPE_IP4UC ? 32 : 128;
+	__be32 ip = addr->s6_addr32[3];
+	struct otto_l3_route *r;
+	struct net_device *dev;
+	bool added = false;
+	int vlan;
+
+	if (!ctrl->cfg->use_l3_tables)
+		return false;
+
+	if (type == ROUTE_TYPE_IP4UC) {
+		if (ipv4_is_multicast(ip) || ipv4_is_lbcast(ip) || ipv4_is_zeronet(ip))
+			return false;
+	} else {
+		int addr_type = ipv6_addr_type(addr);
+
+		if (!(addr_type & IPV6_ADDR_UNICAST) ||
+		    addr_type & (IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK | IPV6_ADDR_MAPPED))
+			return false;
+	}
+
+	r = otto_l3_neigh_find(ctrl, type, addr);
+	if (r && r->gw_ifindex == ifindex)
+		return false;
+	if (r)
+		otto_l3_route_teardown(ctrl, r);
+
+	/* A route of its own from the FIB keeps the entry */
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->tb_id && r->attr.type == type && r->prefix_len == plen &&
+		    (type == ROUTE_TYPE_IP4UC ? r->dst_ip == ip :
+						ipv6_addr_equal(&r->dst_ip6, addr)))
+			return false;
+
+	dev = dev_get_by_index(&init_net, ifindex);
+	if (!dev)
+		return false;
+	if (!is_vlan_dev(dev) || !otto_l3_neigh_on_link(type, addr, dev))
+		goto out;
+	vlan = vlan_dev_vlan_id(dev);
+
+	r = otto_l3_route_alloc(ctrl, addr,
+				type == ROUTE_TYPE_IP4UC && ctrl->cfg->host_route_write ?
+				ROUTE_HOST : ROUTE_PREFIX);
+	if (!r)
+		goto out;
+
+	r->is_neigh = true;
+	r->tb_id = RT_TABLE_MAIN;
+	r->attr.type = type;
+	if (type == ROUTE_TYPE_IP4UC)
+		r->dst_ip = ip;
+	else
+		r->dst_ip6 = *addr;
+	r->prefix_len = plen;
+	r->gw_ifindex = ifindex;
+	r->nh.rvid = vlan;
+	r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, ether_addr_to_u64(dev->dev_addr), vlan);
+
+	/* Trapping until otto_l3_nexthop_update() has a port to forward to */
+	r->attr.valid = true;
+	r->attr.action = ROUTE_ACT_TRAP2CPU;
+	if (r->nh.if_id < 0 || otto_l3_route_install(ctrl, r)) {
+		otto_l3_route_put_intf(ctrl, r);
+		otto_l3_route_free(ctrl, r);
+		goto out;
+	}
+	added = true;
+
+out:
+	dev_put(dev);
+	return added;
+}
+
+static void otto_l3_neigh_del(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
+			      const struct in6_addr *addr)
+{
+	struct otto_l3_route *r = otto_l3_neigh_find(ctrl, type, addr);
+
+	if (r && r->gw_ifindex == ifindex)
+		otto_l3_route_teardown(ctrl, r);
+}
+
 static void otto_l3_fib_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_fib_event_work *fib_work =
 		container_of(work, struct otto_l3_fib_event_work, work);
 	struct otto_l3_ctrl *ctrl = fib_work->ctrl;
 	struct fib_rule *rule;
+	struct in6_addr dst;
 	int err;
 
 	/* Protect internal structures from changes */
@@ -2823,10 +3021,14 @@ static void otto_l3_fib_event_work_do(struct work_struct *work)
 	case FIB_EVENT_ENTRY_ADD:
 	case FIB_EVENT_ENTRY_REPLACE:
 	case FIB_EVENT_ENTRY_APPEND:
+		ipv6_addr_set_v4mapped(fib_work->fen_info.dst, &dst);
+		otto_l3_neigh_evict(ctrl, ROUTE_TYPE_IP4UC, &dst, fib_work->fen_info.dst_len);
 		err = otto_l3_fib_add_v4(ctrl, &fib_work->fen_info);
 		if (err)
 			dev_err(ctrl->dev, "fib_add() failed\n");
 
+		if (ctrl->cfg->use_l3_tables)
+			queue_work(ctrl->priv->wq, &ctrl->neigh_sync_work);
 		fib_info_put(fib_work->fen_info.fi);
 		break;
 	case FIB_EVENT_ENTRY_DEL:
@@ -2834,6 +3036,8 @@ static void otto_l3_fib_event_work_do(struct work_struct *work)
 		if (err)
 			dev_err(ctrl->dev, "fib_del() failed\n");
 
+		if (ctrl->cfg->use_l3_tables)
+			queue_work(ctrl->priv->wq, &ctrl->neigh_sync_work);
 		fib_info_put(fib_work->fen_info.fi);
 		break;
 	case FIB_EVENT_RULE_ADD:
@@ -2862,6 +3066,8 @@ static void otto_l3_fib6_event_work_do(struct work_struct *work)
 	switch (fib_work->event) {
 	case FIB_EVENT_ENTRY_REPLACE:
 	case FIB_EVENT_ENTRY_APPEND:
+		otto_l3_neigh_evict(ctrl, ROUTE_TYPE_IP6UC, &fib_work->fen6_info.rt->fib6_dst.addr,
+				    fib_work->fen6_info.rt->fib6_dst.plen);
 		err = otto_l3_fib_add_v6(ctrl, &fib_work->fen6_info, fib_work->members);
 		break;
 	case FIB_EVENT_ENTRY_DEL:
@@ -2870,6 +3076,7 @@ static void otto_l3_fib6_event_work_do(struct work_struct *work)
 	}
 	if (err)
 		dev_err(ctrl->dev, "FIB6 event %ld failed: %d\n", fib_work->event, err);
+	queue_work(ctrl->priv->wq, &ctrl->neigh_sync_work);
 	rtnl_unlock();
 
 	fib6_info_release(fib_work->fen6_info.rt);
@@ -3002,9 +3209,21 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_net_event_work *net_work =
 		container_of(work, struct otto_l3_net_event_work, work);
+	struct otto_l3_ctrl *ctrl = net_work->ctrl;
+	bool added = false;
 
-	otto_l3_nexthop_update(net_work->ctrl, net_work->type, net_work->ifindex,
-			       &net_work->gw_addr, net_work->mac, net_work->valid);
+	if (net_work->valid)
+		added = otto_l3_neigh_add(ctrl, net_work->type, net_work->ifindex,
+					  &net_work->gw_addr);
+	else
+		otto_l3_neigh_del(ctrl, net_work->type, net_work->ifindex, &net_work->gw_addr);
+
+	/* A sync only adds what is missing: the routes through a gateway
+	 * already follow its neighbour
+	 */
+	if (!net_work->sync || added)
+		otto_l3_nexthop_update(ctrl, net_work->type, net_work->ifindex,
+				       &net_work->gw_addr, net_work->mac, net_work->valid);
 
 	kfree(net_work);
 }
@@ -3017,14 +3236,87 @@ static bool otto_l3_is_nd_tbl(const struct neigh_table *tbl)
 	return IS_REACHABLE(CONFIG_IPV6) && tbl == &nd_tbl;
 }
 
+/* Hands a neighbour on a switch port to otto_l3_net_event_work_do(). Called
+ * with the neighbour table or the neighbour locked, so it only queues.
+ */
+static int otto_l3_neigh_queue(struct otto_l3_ctrl *ctrl, struct neighbour *n, bool sync)
+{
+	struct otto_l3_net_event_work *net_work;
+
+	net_work = kzalloc(sizeof(*net_work), GFP_ATOMIC);
+	if (!net_work)
+		return -ENOMEM;
+
+	INIT_WORK(&net_work->work, otto_l3_net_event_work_do);
+	net_work->ctrl = ctrl;
+	net_work->sync = sync;
+
+	/* A neighbour taken out of the table is marked dead, and keeps a
+	 * NUD_VALID state if it had one
+	 */
+	read_lock_bh(&n->lock);
+	net_work->valid = (n->nud_state & NUD_VALID) && !n->dead;
+	net_work->mac = ether_addr_to_u64(n->ha);
+	read_unlock_bh(&n->lock);
+	net_work->ifindex = n->dev->ifindex;
+	if (n->tbl == &arp_tbl) {
+		ipv6_addr_set_v4mapped(*(__be32 *)n->primary_key,
+				       &net_work->gw_addr);
+		net_work->type = ROUTE_TYPE_IP4UC;
+	} else {
+		net_work->gw_addr = *(struct in6_addr *)n->primary_key;
+		net_work->type = ROUTE_TYPE_IP6UC;
+	}
+
+	dev_dbg(ctrl->dev, "updating neighbour on %s, mac %016llx\n",
+		n->dev->name, net_work->mac);
+	queue_work(ctrl->priv->wq, &net_work->work);
+
+	return 0;
+}
+
+static void otto_l3_neigh_sync_cb(struct neighbour *n, void *cookie)
+{
+	struct otto_l3_ctrl *ctrl = cookie;
+
+	if (!(READ_ONCE(n->nud_state) & NUD_VALID) || READ_ONCE(n->dead) ||
+	    otto_l3_port_dev_lower_find(n->dev, ctrl) < 0)
+		return;
+
+	if (otto_l3_neigh_queue(ctrl, n, true))
+		otto_l3_resync_request(ctrl);
+}
+
+/* Whether a neighbour is on-link follows the routes in main, so after each
+ * route event the entries are checked against them, and the neighbours that
+ * have none yet are handed to otto_l3_net_event_work_do() once more. Queued at
+ * most once at a time.
+ */
+static void otto_l3_neigh_sync_work_do(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(work, struct otto_l3_ctrl, neigh_sync_work);
+	struct otto_l3_route *r, *tmp;
+	struct net_device *dev;
+
+	rtnl_lock();
+	list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list) {
+		if (!r->is_neigh)
+			continue;
+		dev = __dev_get_by_index(&init_net, r->gw_ifindex);
+		if (!dev || !otto_l3_neigh_on_link(r->attr.type, &r->gw_ip, dev))
+			otto_l3_route_teardown(ctrl, r);
+	}
+	rtnl_unlock();
+
+	neigh_for_each(&arp_tbl, otto_l3_neigh_sync_cb, ctrl);
+	if (IS_REACHABLE(CONFIG_IPV6))
+		neigh_for_each(&nd_tbl, otto_l3_neigh_sync_cb, ctrl);
+}
+
 static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long event, void *ptr)
 {
 	struct otto_l3_ctrl *ctrl = container_of(this, struct otto_l3_ctrl, ne_nb);
-	struct rtl838x_switch_priv *priv = ctrl->priv;
-	struct otto_l3_net_event_work *net_work;
 	struct neighbour *n = ptr;
-	struct net_device *dev;
-	int port;
 
 	switch (event) {
 	case NETEVENT_NEIGH_UPDATE:
@@ -3041,42 +3333,15 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 		 */
 		if (otto_l3_is_nd_tbl(n->tbl) && !ctrl->cfg->use_l3_tables)
 			return NOTIFY_DONE;
-		dev = n->dev;
-		port = otto_l3_port_dev_lower_find(dev, ctrl);
-		if (port < 0) {
+		if (otto_l3_port_dev_lower_find(n->dev, ctrl) < 0) {
 			dev_dbg(ctrl->dev, "Neighbour not on a switch port, not updating\n");
 			return NOTIFY_DONE;
 		}
 
-		net_work = kzalloc(sizeof(*net_work), GFP_ATOMIC);
-		if (!net_work) {
+		if (otto_l3_neigh_queue(ctrl, n, false)) {
 			otto_l3_resync_request(ctrl);
 			return NOTIFY_BAD;
 		}
-
-		INIT_WORK(&net_work->work, otto_l3_net_event_work_do);
-		net_work->ctrl = ctrl;
-
-		/* A neighbour taken out of the table is marked dead, and keeps a
-		 * NUD_VALID state if it had one
-		 */
-		read_lock_bh(&n->lock);
-		net_work->valid = (n->nud_state & NUD_VALID) && !n->dead;
-		net_work->mac = ether_addr_to_u64(n->ha);
-		read_unlock_bh(&n->lock);
-		net_work->ifindex = dev->ifindex;
-		if (n->tbl == &arp_tbl) {
-			ipv6_addr_set_v4mapped(*(__be32 *)n->primary_key,
-					       &net_work->gw_addr);
-			net_work->type = ROUTE_TYPE_IP4UC;
-		} else {
-			net_work->gw_addr = *(struct in6_addr *)n->primary_key;
-			net_work->type = ROUTE_TYPE_IP6UC;
-		}
-
-		dev_dbg(ctrl->dev, "updating neighbour on port %d, mac %016llx\n",
-			port, net_work->mac);
-		queue_work(priv->wq, &net_work->work);
 		break;
 	}
 
@@ -3626,6 +3891,7 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 		unregister_fib_notifier(&init_net, &ctrl->fib_nb);
 		ctrl->fib_nb.notifier_call = NULL;
 	}
+	disable_work_sync(&ctrl->neigh_sync_work);
 
 	/* Unregistering stops new events, not the work already queued, and that
 	 * work walks this list. Wait for it before touching the list here: the
@@ -3732,6 +3998,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	/* Until the FIB notifier is in place there is nothing to replay */
 	INIT_DELAYED_WORK(&ctrl->resync_work, otto_l3_resync_work_do);
 	disable_delayed_work(&ctrl->resync_work);
+	INIT_WORK(&ctrl->neigh_sync_work, otto_l3_neigh_sync_work_do);
 
 	match = of_match_node(otto_l3_of_ids, dev->of_node);
 	if (!match)
