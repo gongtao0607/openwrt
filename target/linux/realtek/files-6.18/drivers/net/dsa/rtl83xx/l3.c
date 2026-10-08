@@ -860,7 +860,8 @@ static int otto_l3_port_dev_lower_find(struct net_device *dev, struct otto_l3_ct
 }
 
 /* The VLAN an L3 device of the switch routes in: its own for a VLAN device,
- * the port's PVID for a standalone port
+ * the PVID of its ports for a bridge without VLAN filtering, the port's PVID
+ * for a standalone port
  */
 static int otto_l3_dev_vid(struct otto_l3_ctrl *ctrl, struct net_device *dev)
 {
@@ -869,7 +870,10 @@ static int otto_l3_dev_vid(struct otto_l3_ctrl *ctrl, struct net_device *dev)
 	if (is_vlan_dev(dev))
 		return vlan_dev_vlan_id(dev);
 
-	port = otto_l3_standalone_port(ctrl, dev);
+	if (netif_is_bridge_master(dev) && !br_vlan_enabled(dev))
+		port = otto_l3_port_dev_lower_find(dev, ctrl);
+	else
+		port = otto_l3_standalone_port(ctrl, dev);
 
 	return port >= 0 ? ctrl->priv->ports[port].pvid : 0;
 }
@@ -3187,10 +3191,10 @@ static bool otto_l3_neigh_add(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
 	dev = dev_get_by_index(&init_net, ifindex);
 	if (!dev)
 		return false;
-	if ((!is_vlan_dev(dev) && otto_l3_standalone_port(ctrl, dev) < 0) ||
+	vlan = otto_l3_dev_vid(ctrl, dev);
+	if ((!vlan && otto_l3_standalone_port(ctrl, dev) < 0) ||
 	    !otto_l3_neigh_on_link(type, addr, dev))
 		goto out;
-	vlan = otto_l3_dev_vid(ctrl, dev);
 
 	r = otto_l3_route_alloc(ctrl, addr,
 				type == ROUTE_TYPE_IP4UC && ctrl->cfg->host_route_write ?
