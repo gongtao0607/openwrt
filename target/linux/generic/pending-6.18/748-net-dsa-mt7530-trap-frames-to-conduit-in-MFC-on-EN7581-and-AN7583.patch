@@ -1,0 +1,63 @@
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Wed, 23 Sep 2026 05:46:06 +0000
+Subject: [PATCH] net: dsa: mt7530: trap frames to conduit in MFC on
+ EN7581 and AN7583
+
+On MT7531 and MT7988, trapped frames are forwarded to the CPU ports in
+the MT7531_CFC CPU_PMAP bitmap. EN7581 and AN7583 support was added on
+the assumption that they follow the MT7531 model, so only CFC is set and
+mt753x_conduit_state_change() returns early for them.
+
+On EN7581 this is not enough: frames trapped by the BPC/RGAC registers,
+such as STP BPDUs, do not reach the CPU port unless MT7530_CPU_EN and
+MT7530_CPU_PORT are also set in MT753X_MFC. Ports that use the switch
+(not the GDM ports of the SoC) therefore never receive BPDUs, and an STP
+bridge on them takes the root role while a superior root is reachable.
+
+Tested on an Airoha AN7581 board (Gemtek W1700K) with a user port of the
+switch receiving RSTP BPDUs from the root at 1/s. With CPU_EN clear in
+MFC, as the driver leaves it, no BPDU reached the CPU. Setting CPU_EN and
+CPU_PORT at runtime made them arrive at once, and clearing them stopped
+them again. With this patch they are received from boot.
+
+AN7583 has the same switch IP and the same CFC handling, so it is
+included as well. It was not tested.
+
+Include EN7581 and AN7583 in mt753x_conduit_state_change() and update
+the related comments.
+
+Fixes: 2b0229f67932 ("net: dsa: mt7530: Add EN7581 support")
+Fixes: d76556db10bf ("net: dsa: mt7530: Add AN7583 support")
+Acked-by: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+---
+Index: linux-6.18.55/drivers/net/dsa/mt7530.c
+===================================================================
+--- linux-6.18.55.orig/drivers/net/dsa/mt7530.c
++++ linux-6.18.55/drivers/net/dsa/mt7530.c
+@@ -1283,8 +1283,8 @@ mt753x_cpu_port_enable(struct dsa_switch
+ 		   UNU_FFP(BIT(port)));
+ 
+ 	/* Add the CPU port to the CPU port bitmap for MT7531 and the switch on
+-	 * the MT7988 SoC. Trapped frames will be forwarded to the CPU port that
+-	 * is affine to the inbound user port.
++	 * the MT7988, EN7581 and AN7583 SoCs. Trapped frames will be forwarded
++	 * to the CPU port that is affine to the inbound user port.
+ 	 */
+ 	if (priv->id == ID_MT7531 || priv->id == ID_MT7988 ||
+ 	    priv->id == ID_EN7581 || priv->id == ID_AN7583)
+@@ -3195,10 +3195,12 @@ mt753x_conduit_state_change(struct dsa_s
+ 
+ 	/* Set the CPU port to trap frames to for MT7530. Trapped frames will be
+ 	 * forwarded to the numerically smallest CPU port whose conduit
+-	 * interface is up.
++	 * interface is up. EN7581 and AN7583 need this in addition to the CPU
++	 * port bitmap, or trapped frames never reach the CPU port.
+ 	 */
+ 	if (priv->id != ID_MT7530 && priv->id != ID_MT7621 &&
+-	    priv->id != ID_EN7528)
++	    priv->id != ID_EN7528 &&
++	    priv->id != ID_EN7581 && priv->id != ID_AN7583)
+ 		return;
+ 
+ 	mask = BIT(cpu_dp->index);
