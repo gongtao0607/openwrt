@@ -402,6 +402,7 @@
 #define   PPE_ACL_DEST_TYPE		GENMASK(16, 15)	/* word 0 */
 #define     PPE_ACL_DEST_PORT_BMP	3
 #define   PPE_ACL_MIRROR_EN		BIT(17)		/* word 0 */
+#define   PPE_ACL_BYPASS_EG_STP		BIT(3)		/* word 1 */
 #define   PPE_ACL_DSCP_TC_CHANGE_EN	BIT(14)		/* word 2 */
 #define   PPE_ACL_DSCP_TC		GENMASK(22, 15)	/* word 2 */
 #define   PPE_ACL_PRI_CHANGE_EN		BIT(3)		/* word 3 */
