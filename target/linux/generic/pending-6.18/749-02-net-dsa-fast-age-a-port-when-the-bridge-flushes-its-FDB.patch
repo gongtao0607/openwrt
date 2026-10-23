@@ -1,0 +1,60 @@
+From d7af5ceb5f3fad8f5d09efa50a1f0f769208c8df Mon Sep 17 00:00:00 2001
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Fri, 23 Oct 2026 01:21:17 +0000
+Subject: [PATCH] net: dsa: fast age a port when the bridge flushes its FDB
+
+Handle SWITCHDEV_ATTR_ID_PORT_FDB_FLUSH by fast ageing the port, so the
+dynamic entries the switch has learned on it are removed when user
+space flushes the bridge port, for example on an STP topology change.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+Index: linux-6.18.55/net/dsa/port.c
+===================================================================
+--- linux-6.18.55.orig/net/dsa/port.c
++++ linux-6.18.55/net/dsa/port.c
+@@ -65,6 +65,16 @@ static void dsa_port_fast_age(const stru
+ 	dsa_port_notify_bridge_fdb_flush(dp, 0);
+ }
+ 
++int dsa_port_bridge_fdb_flush(const struct dsa_port *dp)
++{
++	if (!dp->ds->ops->port_fast_age)
++		return -EOPNOTSUPP;
++
++	dsa_port_fast_age(dp);
++
++	return 0;
++}
++
+ static int dsa_port_vlan_fast_age(const struct dsa_port *dp, u16 vid)
+ {
+ 	struct dsa_switch *ds = dp->ds;
+Index: linux-6.18.55/net/dsa/port.h
+===================================================================
+--- linux-6.18.55.orig/net/dsa/port.h
++++ linux-6.18.55/net/dsa/port.h
+@@ -19,6 +19,7 @@ bool dsa_port_supports_hwtstamp(struct d
+ void dsa_port_set_tag_protocol(struct dsa_port *cpu_dp,
+ 			       const struct dsa_device_ops *tag_ops);
+ int dsa_port_set_state(struct dsa_port *dp, u8 state, bool do_fast_age);
++int dsa_port_bridge_fdb_flush(const struct dsa_port *dp);
+ int dsa_port_set_mst_state(struct dsa_port *dp,
+ 			   const struct switchdev_mst_state *state,
+ 			   struct netlink_ext_ack *extack);
+Index: linux-6.18.55/net/dsa/user.c
+===================================================================
+--- linux-6.18.55.orig/net/dsa/user.c
++++ linux-6.18.55/net/dsa/user.c
+@@ -643,6 +643,12 @@ static int dsa_user_port_attr_set(struct
+ 
+ 		ret = dsa_port_vlan_msti(dp, &attr->u.vlan_msti);
+ 		break;
++	case SWITCHDEV_ATTR_ID_PORT_FDB_FLUSH:
++		if (!dsa_port_offloads_bridge_port(dp, attr->orig_dev))
++			return -EOPNOTSUPP;
++
++		ret = dsa_port_bridge_fdb_flush(dp);
++		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 		break;
