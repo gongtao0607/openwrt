@@ -1,0 +1,111 @@
+From 7f53c021eba74cb3e3a92ac92abecd921645ac91 Mon Sep 17 00:00:00 2001
+From: Tao Gong <gongtao0607@gmail.com>
+Date: Fri, 23 Oct 2026 01:21:17 +0000
+Subject: [PATCH] net: bridge: offload FDB flush of a bridge port to switchdev
+ drivers
+
+User space STP daemons (mstpd, ustp) handle a topology change by
+flushing the dynamic FDB entries of the affected ports through the
+brport "flush" sysfs attribute or IFLA_BRPORT_FLUSH. This only removes
+entries from the software bridge.
+
+Switchdev drivers that learn addresses in hardware without reporting
+them to the bridge keep the old entries. When an STP topology change
+moves a station behind another port, the hardware keeps forwarding
+traffic for it to the old port, or drops it because the old port is
+now the ingress port, until the entry ages out or the station sends a
+frame on its new path. The kernel STP implementation does not flush on
+a topology change; it shortens the bridge ageing time, which is
+offloaded to the switch.
+
+Add SWITCHDEV_ATTR_ID_PORT_FDB_FLUSH and set it when a port is flushed
+from user space, so drivers can remove the dynamic entries they learned
+on that port.
+
+Signed-off-by: Tao Gong <gongtao0607@gmail.com>
+Index: linux-6.18.55/include/net/switchdev.h
+===================================================================
+--- linux-6.18.55.orig/include/net/switchdev.h
++++ linux-6.18.55/include/net/switchdev.h
+@@ -31,6 +31,7 @@ enum switchdev_attr_id {
+ 	SWITCHDEV_ATTR_ID_BRIDGE_MST,
+ 	SWITCHDEV_ATTR_ID_MRP_PORT_ROLE,
+ 	SWITCHDEV_ATTR_ID_VLAN_MSTI,
++	SWITCHDEV_ATTR_ID_PORT_FDB_FLUSH,
+ };
+ 
+ struct switchdev_mst_state {
+Index: linux-6.18.55/net/bridge/br_netlink.c
+===================================================================
+--- linux-6.18.55.orig/net/bridge/br_netlink.c
++++ linux-6.18.55/net/bridge/br_netlink.c
+@@ -1027,8 +1027,10 @@ static int br_setport(struct net_bridge_
+ 			return err;
+ 	}
+ 
+-	if (tb[IFLA_BRPORT_FLUSH])
++	if (tb[IFLA_BRPORT_FLUSH]) {
+ 		br_fdb_delete_by_port(p->br, p, 0, 0);
++		br_switchdev_port_fdb_flush(p);
++	}
+ 
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	if (tb[IFLA_BRPORT_MULTICAST_ROUTER]) {
+Index: linux-6.18.55/net/bridge/br_private.h
+===================================================================
+--- linux-6.18.55.orig/net/bridge/br_private.h
++++ linux-6.18.55/net/bridge/br_private.h
+@@ -2222,6 +2222,7 @@ int br_switchdev_set_port_flag(struct ne
+ 			       unsigned long flags,
+ 			       unsigned long mask,
+ 			       struct netlink_ext_ack *extack);
++void br_switchdev_port_fdb_flush(struct net_bridge_port *p);
+ void br_switchdev_fdb_notify(struct net_bridge *br,
+ 			     const struct net_bridge_fdb_entry *fdb, int type);
+ void br_switchdev_mdb_notify(struct net_device *dev,
+@@ -2306,6 +2307,10 @@ static inline int br_switchdev_set_port_
+ 	return 0;
+ }
+ 
++static inline void br_switchdev_port_fdb_flush(struct net_bridge_port *p)
++{
++}
++
+ static inline int br_switchdev_port_vlan_add(struct net_device *dev, u16 vid,
+ 					     u16 flags, bool changed,
+ 					     struct netlink_ext_ack *extack)
+Index: linux-6.18.55/net/bridge/br_switchdev.c
+===================================================================
+--- linux-6.18.55.orig/net/bridge/br_switchdev.c
++++ linux-6.18.55/net/bridge/br_switchdev.c
+@@ -124,6 +124,18 @@ int br_switchdev_set_port_flag(struct ne
+ 	return 0;
+ }
+ 
++/* Let the driver flush the dynamic FDB entries it has learned on the port */
++void br_switchdev_port_fdb_flush(struct net_bridge_port *p)
++{
++	struct switchdev_attr attr = {
++		.orig_dev = p->dev,
++		.id = SWITCHDEV_ATTR_ID_PORT_FDB_FLUSH,
++		.flags = SWITCHDEV_F_DEFER,
++	};
++
++	switchdev_port_attr_set(p->dev, &attr, NULL);
++}
++
+ static void br_switchdev_fdb_populate(struct net_bridge *br,
+ 				      struct switchdev_notifier_fdb_info *item,
+ 				      const struct net_bridge_fdb_entry *fdb,
+Index: linux-6.18.55/net/bridge/br_sysfs_if.c
+===================================================================
+--- linux-6.18.55.orig/net/bridge/br_sysfs_if.c
++++ linux-6.18.55/net/bridge/br_sysfs_if.c
+@@ -194,6 +194,7 @@ static BRPORT_ATTR(hold_timer, 0444, sho
+ static int store_flush(struct net_bridge_port *p, unsigned long v)
+ {
+ 	br_fdb_delete_by_port(p->br, p, 0, 0); // Don't delete local entry
++	br_switchdev_port_fdb_flush(p);
+ 	return 0;
+ }
+ static BRPORT_ATTR(flush, 0200, NULL, store_flush);
