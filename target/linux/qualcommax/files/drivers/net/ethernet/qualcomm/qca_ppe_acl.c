@@ -1457,6 +1457,7 @@ static ushort ppe_small_pkt_prio = 5;
 static struct qca_ppe_priv *ppe_acl_priv;
 
 static struct ppe_acl_group ppe_small_pkt_group[2];
+static struct ppe_acl_group ppe_link_local_group;
 
 /* ethtool's n-tuple table is the second way into the same engine, and the only
  * one that reaches the queue action: its ring cookie names a queue of the whole
@@ -1621,6 +1622,25 @@ static void ppe_acl_small_pkt_apply(struct qca_ppe_priv *priv)
 	}
 }
 
+/* The egress STP check applies to the CPU's own frames too, so a port the
+ * bridge holds discarding cannot send the BPDU that would move it on. Let
+ * the CPU's link-local frames past it; the bridge already decides where they
+ * go.
+ */
+static void ppe_acl_link_local_apply(struct qca_ppe_priv *priv)
+{
+	static const u8 mask[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 };
+	u32 act[PPE_ACL_ACTION_WORDS] = { [1] = PPE_ACL_BYPASS_EG_STP };
+	struct ppe_acl_slice s = { .type = PPE_ACL_TYPE_MAC_DA };
+
+	ppe_acl_mac_words(s.key, eth_reserved_addr_base);
+	ppe_acl_mac_words(s.mask, mask);
+
+	if (!ppe_acl_alloc(priv, &s, 1, &ppe_link_local_group))
+		ppe_acl_slice_write(priv, ppe_link_local_group.index[0], &s,
+				    act, BIT(QCA_PPE_CPU_PORT), 0);
+}
+
 static int ppe_small_pkt_param_set(const char *val,
 				   const struct kernel_param *kp)
 {
@@ -1666,6 +1686,7 @@ void ppe_acl_init(struct qca_ppe_priv *priv)
 
 	mutex_lock(&priv->acl_lock);
 	ppe_acl_priv = priv;
+	ppe_acl_link_local_apply(priv);
 	ppe_acl_small_pkt_apply(priv);
 	mutex_unlock(&priv->acl_lock);
 }
@@ -1692,6 +1713,8 @@ void ppe_acl_exit(struct qca_ppe_priv *priv)
 		list_del(&r->list);
 		ppe_acl_rule_free(priv, r);
 	}
+	if (ppe_link_local_group.nslices)
+		ppe_acl_free(priv, &ppe_link_local_group);
 	for (i = 0; i < ARRAY_SIZE(ppe_small_pkt_group); i++)
 		if (ppe_small_pkt_group[i].nslices)
 			ppe_acl_free(priv, &ppe_small_pkt_group[i]);
